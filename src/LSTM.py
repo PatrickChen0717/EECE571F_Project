@@ -26,13 +26,6 @@ class LSTM_gat(nn.Module):
             batch_first=False,
         )
 
-        self.gat = GAT(
-            in_dim=hidden_size,
-            out_dim=hidden_size,
-            dropout=0.0,
-            sigma="elu"
-        )
-        
         self.gat_out_dim = hidden_size
         self.gat = GAT(in_dim=hidden_size, out_dim=self.gat_out_dim, dropout=0.0, sigma="elu")
 
