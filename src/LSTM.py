@@ -30,9 +30,17 @@ class LSTM_gat(nn.Module):
         self.gat = GAT(in_dim=hidden_size, out_dim=self.gat_out_dim, dropout=0.0, sigma="elu")
 
     @staticmethod
-    def add_virtual_root(pos):  # (B,T,M,K,2)
-        root = pos.mean(dim=3, keepdim=True)   # (B,T,M,1,2)
-        return torch.cat([pos, root], dim=3)   # (B,T,M,K+1,2)
+    def add_virtual_root(pos, valid_xy=None):  # pos: (B,T,M,K,2), K=5
+        if valid_xy is None:
+            # valid if finite
+            valid_xy = torch.isfinite(pos).all(dim=-1)  # (B,T,M,K)
+
+        pos_clean = torch.nan_to_num(pos, nan=0.0)
+        w = valid_xy.unsqueeze(-1).float()              # (B,T,M,K,1)
+        denom = w.sum(dim=3, keepdim=True).clamp_min(1.0)  # (B,T,M,1,1)
+        root = (pos_clean * w).sum(dim=3, keepdim=True) / denom  # (B,T,M,1,2)
+
+        return torch.cat([pos_clean, root], dim=3)      # (B,T,M,6,2) root LAST
 
     @staticmethod
     def build_edge_index(num_instruments, K_with_root, device):
@@ -72,7 +80,8 @@ class LSTM_gat(nn.Module):
         B, T, M, K, _ = pos.shape
 
         # add root => K+1 nodes per instrument
-        posR = self.add_virtual_root(pos)          # (B,T,M,K+1,2)
+        valid_xy = torch.isfinite(pos).all(dim=-1)      # (B,T,M,5)
+        posR = self.add_virtual_root(pos, valid_xy)  
         KR = posR.shape[3]
         N = M * KR
 

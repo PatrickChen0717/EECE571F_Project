@@ -13,23 +13,24 @@ device = "cpu"
 encoder = LSTM_gat(hidden_size=128, embed_dim=64)
 model = FullModel(encoder, gat_out_dim=128).to(device)
 
-ckpt = "models/model_weights_2026-02-27_19-30-26/epoch14.pth"
+# ckpt = "models/model_weights_2026-02-27_23-57-36/epoch35.pth"
+ckpt = "models/model_weights_2026-02-28_18-19-33/epoch86.pth"
 model.load_state_dict(torch.load(ckpt, map_location=device))
 model.eval()
 
-O = 80
-P = 40
+O = 30
+P = 30
 
 # ----- dataset -----
 paths_left  = glob.glob(r"C:\Users\Patrick\Documents\eece571F\SurgPose_dataset\**\keypoints_left.yaml",  recursive=True)
-# paths_right = glob.glob(r"C:\Users\Patrick\Documents\eece571F\SurgPose_dataset\**\keypoints_right.yaml", recursive=True)
-yaml_paths = paths_left
+paths_right = glob.glob(r"C:\Users\Patrick\Documents\eece571F\SurgPose_dataset\**\keypoints_right.yaml", recursive=True)
+yaml_paths = paths_left + paths_right
 
 random.seed(42)
-n_keep = int(0.05 * len(yaml_paths))
+n_keep = int(0.05*len(yaml_paths))
 yaml_paths = random.sample(yaml_paths, n_keep)
 
-ds = KeypointDataset(yaml_paths=yaml_paths, normalize=True)
+ds = KeypointDataset(yaml_paths=yaml_paths, normalize=False)
 test_dl = DataLoader(ds, batch_size=32, shuffle=False)
 
 def _mu_from_model_out(out):
@@ -43,23 +44,46 @@ def _mu_from_model_out(out):
         return out[..., 0:2]
     raise RuntimeError(f"Unexpected output last dim C={C}")
 
-def add_virtual_root_with_model(model, x5):
+def add_virtual_root_with_model(model, x5, valid5=None):
     """
-    x5:
-      - (T,M,5,2) or (B,T,M,5,2)
-    returns:
-      - (T,M,6,2) or (B,T,M,6,2)
+    Accepts:
+      (M,5,2)
+      (T,M,5,2)
+      (B,T,M,5,2)
+    valid5 matches the leading dims:
+      (M,5) or (T,M,5) or (B,T,M,5)
+    Returns:
+      (M,6,2) or (T,M,6,2) or (B,T,M,6,2)
     """
-    if x5.dim() == 4:
+    if x5.dim() == 3:
+        # (M,5,2) -> (1,1,M,5,2)
+        x5_bt = x5.unsqueeze(0).unsqueeze(0)
+        if valid5 is None:
+            valid5_bt = torch.isfinite(x5_bt).all(dim=-1)  # (1,1,M,5)
+        else:
+            valid5_bt = valid5.unsqueeze(0).unsqueeze(0)
+        x6_bt = model.encoder.add_virtual_root(x5_bt, valid5_bt)   # (1,1,M,6,2)
+        return x6_bt[0, 0]
+
+    elif x5.dim() == 4:
         # (T,M,5,2) -> (1,T,M,5,2)
-        x5_b = x5.unsqueeze(0)
-        x6_b = model.encoder.add_virtual_root(x5_b)   # (1,T,M,6,2)
-        return x6_b[0]                                # (T,M,6,2)
+        x5_bt = x5.unsqueeze(0)
+        if valid5 is None:
+            valid5_bt = torch.isfinite(x5_bt).all(dim=-1)          # (1,T,M,5)
+        else:
+            valid5_bt = valid5.unsqueeze(0)
+        x6_bt = model.encoder.add_virtual_root(x5_bt, valid5_bt)   # (1,T,M,6,2)
+        return x6_bt[0]
+
     elif x5.dim() == 5:
-        return model.encoder.add_virtual_root(x5)
+        # (B,T,M,5,2)
+        if valid5 is None:
+            valid5 = torch.isfinite(x5).all(dim=-1)
+        return model.encoder.add_virtual_root(x5, valid5)
+
     else:
         raise ValueError(f"Unexpected x5 dim: {x5.dim()}")
-
+    
 @torch.no_grad()
 def predict_full_episode_autoreg(model, x_full, O=10, device="cpu", instr_id=0, kp_id=0):
     """
@@ -67,44 +91,44 @@ def predict_full_episode_autoreg(model, x_full, O=10, device="cpu", instr_id=0, 
     returns pred6: (L,M,6,2)
     """
     model.eval()
-    x_full = x_full[..., :2]
-    x_full = torch.nan_to_num(x_full, nan=0.0)
+    x_full = x_full[..., :2]                         # keep xy
     L, M, K, _ = x_full.shape
     O = min(O, L)
 
-    # seed with GT first O frames
-    seq = x_full[:O].clone()                         # (O,M,5,2)
-    out6 = add_virtual_root_with_model(model, seq)   # (O,M,6,2)
-    preds6 = [out6[t].cpu() for t in range(O)]       # list of (M,6,2)
+    # keep raw + clean + valid
+    x_raw = x_full.clone()
+    x_clean = torch.nan_to_num(x_raw, nan=0.0)
+    x_valid5 = torch.isfinite(x_raw).all(dim=-1)     # (L,M,5)
 
-    for _ in range(O, L):
-        hist = seq[-O:]                               # (O,M,5,2)
-        win_in = hist.unsqueeze(0).to(device)         # (1,O,M,5,2)
-        # print("step", _, "hist_last(kp0)", hist[-1, 0, 0].tolist()) 
-        
-        out = model(win_in)                           # (1,O,N,C)
+    # seed with GT first O frames
+    seq_raw   = x_raw[:O].clone()                    # (O,M,5,2)
+    seq_clean = x_clean[:O].clone()
+    seq_valid = x_valid5[:O].clone()                 # (O,M,5)
+
+    out6 = add_virtual_root_with_model(model, seq_raw, seq_valid)  # (O,M,6,2)
+    preds6 = [out6[t].cpu() for t in range(O)]
+
+    for t in range(O, L):
+        hist_clean = seq_clean[-O:]                   # (O,M,5,2)
+        win_in = hist_clean.unsqueeze(0).to(device)   # (1,O,M,5,2)
+
+        out = model(win_in)                           # (1,O,N,2/4)
         mu = _mu_from_model_out(out)                  # (1,O,N,2)
-        dposN = mu[0, -1].detach().cpu()              # (N,2) where N=M*6
-        
-        # reshape N back to (M,6,2)
+        dposN = mu[0, -1].detach().cpu()              # (N,2)
         dpos6 = dposN.view(M, 6, 2)                   # (M,6,2)
-        # print("step", _, "delta", dpos6[instr_id, kp_id])
-        
-        last6 = preds6[-1]                            # (M,6,2)
+
+
+        last6 = preds6[-1]                            # (M,6,2) on CPU
         next6 = last6 + dpos6                         # (M,6,2)
 
-        # enforce root consistency using the SAME encoder rule
-        next5 = next6[:, :5, :]                      # (M,5,2)
-        next6 = add_virtual_root_with_model(model, next5.unsqueeze(0))[0].cpu()  # (M,6,2)
+        next5 = next6[:, :5, :]                       # (M,5,2)
+        next_valid5 = torch.ones((M, 5), dtype=torch.bool)  # predicted kps treated as valid
+        next6 = add_virtual_root_with_model(model, next5, next_valid5).cpu()
 
         preds6.append(next6)
-        seq = torch.cat([seq, next5.unsqueeze(0)], dim=0)  # (t,M,5,2)
 
-    # print("Last absolute position:")
-    # print(last6)
-
-    # print("Next predicted absolute position:")
-    # print(next6)
+        # slide windows (raw validity no longer matters after prediction; predicted are valid)
+        seq_clean = torch.cat([seq_clean, next5.unsqueeze(0)], dim=0)
 
     return torch.stack(preds6, dim=0)                 # (L,M,6,2)
 
@@ -120,7 +144,8 @@ def plot_full_episode(model, sample, device, instr_id=0, kp_id=0, O=10):
     valid_xy = torch.isfinite(x_full).all(dim=-1)
 
     pred6 = predict_full_episode_autoreg(model, x_full, O=O, device=device, instr_id=instr_id, kp_id=kp_id)
-    gt6   = add_virtual_root_with_model(model, torch.nan_to_num(x_full, nan=0.0))
+    gt_valid5 = torch.isfinite(x_full).all(dim=-1)
+    gt6 = add_virtual_root_with_model(model, x_full, gt_valid5)
 
     node_id = kp_id
     mask = valid_xy[:, instr_id, kp_id].cpu()
