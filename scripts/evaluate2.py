@@ -14,7 +14,7 @@ encoder = LSTM_gat(hidden_size=128, embed_dim=64)
 model = FullModel(encoder, gat_out_dim=128).to(device)
 
 # ckpt = "models/model_weights_2026-02-27_23-57-36/epoch35.pth"
-ckpt = "models/model_weights_2026-02-28_18-19-33/epoch83.pth"
+ckpt = "models/model_weights_2026-03-09_22-50-50/epoch74.pth"
 model.load_state_dict(torch.load(ckpt, map_location=device))
 model.eval()
 
@@ -126,29 +126,37 @@ def predict_episode_blockwise_no_overlap(model, x_full, O=30, P=10, device="cpu"
 
         # ----- autoregressive prediction for P steps -----
         seq_clean = torch.nan_to_num(obs5_raw, nan=0.0)      # (O,M,5,2)
+        seq_valid5 = torch.isfinite(obs5_raw).all(dim=-1)    # (O,M,5)
         last6 = obs6[-1].cpu()                               # (M,6,2)
 
         maxP = min(P, L - (t + O))
         for k in range(maxP):
-            win_in = seq_clean.unsqueeze(0).to(device)       # (1,O,M,5,2)
+            win_delta = seq_clean[1:] - seq_clean[:-1]       # (O-1,M,5,2)
+            win_delta_valid = seq_valid5[1:] & seq_valid5[:-1]
+            win_delta = torch.where(
+                win_delta_valid.unsqueeze(-1),
+                win_delta,
+                torch.zeros_like(win_delta)
+            )
 
-            out = model(win_in)                              # (1,O,N,2/4)
-            mu = _mu_from_model_out(out)                     # (1,O,N,2)
-            dposN = mu[0, -1].detach().cpu()                 # (N,2)
-            dpos6 = dposN.view(M, 6, 2)                      # (M,6,2)
+            win_in = win_delta.unsqueeze(0).to(device)       # (1,O-1,M,5,2)
 
-            next6 = last6 + dpos6                            # (M,6,2)
-            next5 = next6[:, :5, :]                          # (M,5,2)
+            out = model(win_in)
+            mu = _mu_from_model_out(out)
+            dposN = mu[0, -1].detach().cpu()
+            dpos6 = dposN.view(M, 6, 2)
+
+            next6 = last6 + dpos6
+            next5 = next6[:, :5, :]
             next_valid5 = torch.ones((M, 5), dtype=torch.bool)
 
-            # recompute root consistently
             next6 = add_virtual_root_with_model(model, next5, next_valid5).cpu()
 
             pred6[t+O+k] = next6
             last6 = next6
 
-            # slide window with predicted next5
             seq_clean = torch.cat([seq_clean[1:], next5.unsqueeze(0)], dim=0)
+            seq_valid5 = torch.cat([seq_valid5[1:], next_valid5.unsqueeze(0)], dim=0)
 
         t += stride
 
@@ -224,4 +232,4 @@ i = 0
 sample = {k: (v[i] if torch.is_tensor(v) else v) for k, v in batch.items()}
 
 print("episode length:", sample["x"].shape[0])
-plot_full_episode(model, sample, device=device, instr_id=0, kp_id=3, O=O)
+plot_full_episode(model, sample, device=device, instr_id=0, kp_id=1, O=O)

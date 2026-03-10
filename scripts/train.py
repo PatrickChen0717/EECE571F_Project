@@ -105,37 +105,59 @@ def _as_delta_pred(model_out):
     else:
         raise RuntimeError(f"Unexpected model output last dim C={C}")
 
+def _make_input_delta(model, pos_raw):
+    """
+    pos_raw: (B,T,M,5,2) absolute positions with NaNs possible
 
-def _make_gt_and_mask(model, pos_raw):
-    """
-    pos_raw: (B,T,M,5,2) with NaNs possible
     returns:
-      gt_delta: (B,T-1,N,2) where N=M*6
-      mask:     (B,T-1,N,2) float
-      pos_clean:(B,T,M,5,2) cleaned (NaNs->0) for model input
+      delta_in: (B,T-1,M,5,2)   delta input for the model
+      pos_clean: (B,T,M,5,2)    cleaned absolute positions
+      valid_xy: (B,T,M,5)       validity of absolute positions
     """
-    # validity per kp (True if both x,y finite)
     valid_xy = torch.isfinite(pos_raw).all(dim=-1)          # (B,T,M,5)
     pos_clean = torch.nan_to_num(pos_raw, nan=0.0)          # (B,T,M,5,2)
 
-    # IMPORTANT: build pos6 from RAW + valid mask, not from cleaned tensor
-    pos6 = model.encoder.add_virtual_root(pos_raw, valid_xy)  # (B,T,M,6,2) root LAST
+    delta_in = pos_clean[:, 1:] - pos_clean[:, :-1]         # (B,T-1,M,5,2)
 
-    gt_delta = pos6[:, 1:] - pos6[:, :-1]                   # (B,T-1,M,6,2)
-    gt_delta = gt_delta.reshape(gt_delta.size(0), gt_delta.size(1), -1, 2)  # (B,T-1,N,2)
+    # delta valid only if both endpoints valid
+    valid_delta = valid_xy[:, 1:] & valid_xy[:, :-1]        # (B,T-1,M,5)
+    delta_in = torch.where(valid_delta.unsqueeze(-1), delta_in, torch.zeros_like(delta_in))
 
-    # mask for delta valid: endpoints must be valid
-    valid_delta5 = valid_xy[:, 1:] & valid_xy[:, :-1]       # (B,T-1,M,5)
+    return delta_in, pos_clean, valid_xy
 
-    root_valid_t  = valid_xy.any(dim=-1)                    # (B,T,M) root valid if any kp valid
+def _make_gt_and_mask(model, pos_raw):
+    """
+    pos_raw: (B,T,M,5,2) absolute positions with NaNs possible
+
+    returns:
+      gt_delta:  (B,T-1,N,2)
+      mask:      (B,T-1,N,2)
+      delta_in:  (B,T-1,M,5,2)   model input
+      pos_clean: (B,T,M,5,2)
+    """
+    valid_xy = torch.isfinite(pos_raw).all(dim=-1)              # (B,T,M,5)
+    pos_clean = torch.nan_to_num(pos_raw, nan=0.0)
+
+    # absolute positions with root
+    pos6 = model.encoder.add_virtual_root(pos_raw, valid_xy)    # (B,T,M,6,2)
+
+    # GT delta on 6 nodes
+    gt_delta = pos6[:, 1:] - pos6[:, :-1]                       # (B,T-1,M,6,2)
+    gt_delta = gt_delta.reshape(gt_delta.size(0), gt_delta.size(1), -1, 2)
+
+    # delta-input for model on original 5 keypoints
+    delta_in = pos_clean[:, 1:] - pos_clean[:, :-1]             # (B,T-1,M,5,2)
+    valid_delta5 = valid_xy[:, 1:] & valid_xy[:, :-1]           # (B,T-1,M,5)
+    delta_in = torch.where(valid_delta5.unsqueeze(-1), delta_in, torch.zeros_like(delta_in))
+
+    root_valid_t = valid_xy.any(dim=-1)                         # (B,T,M)
     root_valid_dt = root_valid_t[:, 1:] & root_valid_t[:, :-1]  # (B,T-1,M)
 
-    # node order matches add_virtual_root: [kp1..kp5, root]
-    valid_delta6 = torch.cat([valid_delta5, root_valid_dt.unsqueeze(-1)], dim=-1)  # (B,T-1,M,6)
+    valid_delta6 = torch.cat([valid_delta5, root_valid_dt.unsqueeze(-1)], dim=-1)
     mask = valid_delta6.unsqueeze(-1).expand(-1, -1, -1, -1, 2).float()
     mask = mask.reshape(mask.size(0), mask.size(1), -1, 2)
 
-    return gt_delta, mask, pos_clean
+    return gt_delta, mask, delta_in, pos_clean
 
 
 def train_one_epoch(
@@ -157,11 +179,11 @@ def train_one_epoch(
         # (A) Teacher-forced delta loss
         # -------------------------
         full_raw = torch.cat([obs_raw, fut_raw], dim=1)  # keep NaNs
-        gt_delta, mask_delta, full_clean = _make_gt_and_mask(model, full_raw)
+        gt_delta, mask_delta, full_delta_in, full_clean = _make_gt_and_mask(model, full_raw)
 
-        out_tf = model(full_clean)             # (B,T,N,2/4) or (B,T,1,N,2/4)
-        pred_mu_tf = _as_delta_pred(out_tf)    # (B,T,N,2)
-        pred_delta_tf = pred_mu_tf[:, :-1]     # (B,T-1,N,2)
+        out_tf = model(full_delta_in)          # input is delta now
+        pred_mu_tf = _as_delta_pred(out_tf)    # (B,T-1,N,2)
+        pred_delta_tf = pred_mu_tf
 
         delta_loss = ((pred_delta_tf - gt_delta) ** 2 * mask_delta).sum() / mask_delta.sum().clamp_min(1.0)
 
@@ -178,13 +200,17 @@ def train_one_epoch(
         B, _, M, _, _ = obs.shape
 
         # Keep BOTH raw and clean windows, plus a validity window
-        seq_raw = obs_raw.clone()                                  # (B,O,M,5,2) still has NaNs
-        seq_clean = obs.clone()                                    # (B,O,M,5,2) no NaNs
-        seq_valid5 = torch.isfinite(seq_raw).all(dim=-1)            # (B,O,M,5)
+        seq_raw = obs_raw.clone()                                  # (B,O,M,5,2)
+        seq_clean = obs.clone()
+        seq_valid5 = torch.isfinite(seq_raw).all(dim=-1)
+
+        seq_delta = seq_clean[:, 1:] - seq_clean[:, :-1]          # (B,O-1,M,5,2)
+        seq_delta_valid = seq_valid5[:, 1:] & seq_valid5[:, :-1]
+        seq_delta = torch.where(seq_delta_valid.unsqueeze(-1), seq_delta, torch.zeros_like(seq_delta))
 
         preds6 = []
         for _step in range(P):
-            out = model(seq_clean)
+            out = model(seq_delta)
             mu = _as_delta_pred(out)                               # (B,O,N,2)
             dposN = mu[:, -1]                                      # (B,N,2)
             dpos6 = dposN.view(B, M, 6, 2)                         # (B,M,6,2)
@@ -211,6 +237,10 @@ def train_one_epoch(
             seq_raw = torch.cat([seq_raw[:, 1:], next5.unsqueeze(1)], dim=1)
             seq_valid5 = torch.cat([seq_valid5[:, 1:], next_valid5.unsqueeze(1)], dim=1)
             seq_clean = torch.nan_to_num(seq_raw, nan=0.0)
+
+            seq_delta = seq_clean[:, 1:] - seq_clean[:, :-1]
+            seq_delta_valid = seq_valid5[:, 1:] & seq_valid5[:, :-1]
+            seq_delta = torch.where(seq_delta_valid.unsqueeze(-1), seq_delta, torch.zeros_like(seq_delta))
 
         pred_fut6 = torch.stack(preds6, dim=1)                     # (B,P,M,6,2)
 
@@ -252,11 +282,11 @@ def evaluate_one_epoch(
 
         # ---- teacher-forced delta loss ----
         full_raw = torch.cat([obs_raw, fut_raw], dim=1)
-        gt_delta, mask_delta, full_clean = _make_gt_and_mask(model, full_raw)
+        gt_delta, mask_delta, full_delta_in, full_clean = _make_gt_and_mask(model, full_raw)
 
-        out_tf = model(full_clean)
+        out_tf = model(full_delta_in)
         pred_mu_tf = _as_delta_pred(out_tf)
-        pred_delta_tf = pred_mu_tf[:, :-1]
+        pred_delta_tf = pred_mu_tf
 
         delta_loss = ((pred_delta_tf - gt_delta) ** 2 * mask_delta).sum() / mask_delta.sum().clamp_min(1.0)
 
@@ -274,9 +304,13 @@ def evaluate_one_epoch(
         seq_clean = obs.clone()
         seq_valid5 = torch.isfinite(seq_raw).all(dim=-1)
 
+        seq_delta = seq_clean[:, 1:] - seq_clean[:, :-1]
+        seq_delta_valid = seq_valid5[:, 1:] & seq_valid5[:, :-1]
+        seq_delta = torch.where(seq_delta_valid.unsqueeze(-1), seq_delta, torch.zeros_like(seq_delta))
+
         preds6 = []
         for _step in range(P):
-            out = model(seq_clean)
+            out = model(seq_delta)
             mu = _as_delta_pred(out)
             dposN = mu[:, -1]
             dpos6 = dposN.view(B, M, 6, 2)

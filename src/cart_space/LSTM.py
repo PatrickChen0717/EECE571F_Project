@@ -13,7 +13,7 @@ class LSTM_gat(nn.Module):
 
         # Φ embedding
         self.phi = nn.Sequential(
-            nn.Linear(2, embed_dim),
+            nn.Linear(3, embed_dim),
             nn.ReLU(),
             nn.Linear(embed_dim, embed_dim)
         )
@@ -66,38 +66,52 @@ class LSTM_gat(nn.Module):
 
         return torch.tensor(edges, dtype=torch.long, device=device).t().contiguous()  # (2,E)
 
-    def forward(self, delta):
+    def forward(self, pos):
         """
-        delta: (B, T, M, K, 2)
-            precomputed delta positions
+        pos: (B, T, M, K, 2)
+          B batch
+          T timesteps
+          M instruments
+          K keypoints per instrument (without root)
         returns:
-        r:    (B, T, N, Dlstm)
-        rhat: (B, T, N, Dgat)
+          r:    (B, T, N, Dlstm)   node temporal features
+          rhat: (B, T, N, Dgat)    after GAT interaction
         """
-        B, T, M, K, _ = delta.shape
+        B, T, M, K, _ = pos.shape
 
-        valid_delta = torch.isfinite(delta).all(dim=-1)   # (B,T,M,K)
-
-        # root is mean delta-motion node
-        deltaR = self.add_virtual_root(delta, valid_delta)   # (B,T,M,KR,2)
-        KR = deltaR.shape[3]
+        # add root => K+1 nodes per instrument
+        valid_xy = torch.isfinite(pos).all(dim=-1)      # (B,T,M,5)
+        posR = self.add_virtual_root(pos, valid_xy)  
+        KR = posR.shape[3]
         N = M * KR
 
-        v = self.phi(deltaR)                                 # (B,T,M,KR,embed)
-        v = v.reshape(B, T, N, self.embed_dim)
+        # Δp_t
+        delta = posR[:, 1:] - posR[:, :-1]         # (B,T-1,M,KR,2)
+        delta0 = torch.zeros_like(posR[:, :1])     # (B,1,M,KR,2)
+        delta = torch.cat([delta0, delta], dim=1)  # (B,T,M,KR,2)
 
-        v_lstm = v.permute(1, 0, 2, 3).contiguous().reshape(T, B * N, self.embed_dim)
-        r_lstm, _ = self.lstm_spa(v_lstm)
+        # Φ embedding
+        v = self.phi(delta)                         # (B,T,M,KR,embed)
+        v = v.view(B, T, N, self.embed_dim)         # (B,T,N,embed)
+
+        # shared LSTM across nodes: flatten nodes into batch
+        v_lstm = v.permute(1, 0, 2, 3).contiguous().view(T, B * N, self.embed_dim)  # (T,B*N,embed)
+        r_lstm, _ = self.lstm_spa(v_lstm)                                                # (T,B*N,Dlstm)
         Dl = r_lstm.shape[-1]
-        r = r_lstm.reshape(T, B, N, Dl).permute(1, 0, 2, 3).contiguous()
+        r = r_lstm.view(T, B, N, Dl).permute(1, 0, 2, 3).contiguous()                    # (B,T,N,Dl)
 
-        edge_index = self.build_edge_index(M, KR, device=delta.device)
+        # build edges for this M (safe if M varies)
+        edge_index = self.build_edge_index(M, KR, device=pos.device)                     # (2,E)
+
+        # GAT per time step. If your GAT isn't batched, loop batch too.
+        rhat = torch.empty((B, T, N, self.gat_out_dim), device=pos.device, dtype=r.dtype)
+        edge_index = edge_index.to(pos.device)
 
         rhat_list = []
         for t in range(T):
-            rhat_t = self.gat(r[:, t], edge_index)   # (B,N,Dgat)
+            rhat_t = self.gat(r[:, t], edge_index)   # (B, N, Dgat)
             rhat_list.append(rhat_t)
 
-        rhat = torch.stack(rhat_list, dim=1)         # (B,T,N,Dgat)
+        rhat = torch.stack(rhat_list, dim=1)         # (B, T, N, Dgat)
 
         return r, rhat
