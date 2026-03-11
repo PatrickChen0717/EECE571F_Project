@@ -7,6 +7,8 @@ from torch.utils.data import Dataset
 
 import yaml, numpy as np, torch
 from torch.utils.data import Dataset
+from PIL import Image
+from torchvision import transforms
 
 
 def load_yaml_episode(yaml_path: str, groups):
@@ -74,19 +76,50 @@ class KeypointDataset(Dataset):
         
 
 class WindowedKeypointDataset(Dataset):
-    def __init__(self, base_subset, O=10, P=5, random_window=True):
+    def __init__(self, base_subset, O=10, P=5, random_window=True, img_transform=None):
         self.base = base_subset
         self.O = O
         self.P = P
         self.L = O + P
         self.random_window = random_window
+        
+        
+        self.img_transform = img_transform or transforms.Compose([
+            transforms.Resize((224, 224)),
+            transforms.ToTensor(),
+            transforms.Normalize(
+                mean=[0.485, 0.456, 0.406],
+                std=[0.229, 0.224, 0.225]
+            )
+        ])
+
 
     def __len__(self):
         return len(self.base)
 
+    def _get_frame_path(self, episode_path, frame_idx):
+        """
+        Modify this function to match your actual dataset structure.
+
+        Example assumption:
+        - YAML path: .../keypoints_left.yaml
+        - Image path: .../left_frames/000123.png
+        or       : .../images_left/000123.png
+        """
+        episode_dir = os.path.dirname(episode_path)
+
+        candidate = os.path.join(episode_dir, "regular/left_frames", f"{frame_idx:06d}.png")
+        if os.path.exists(candidate):
+            return candidate
+
+        raise FileNotFoundError(
+            f"Could not find frame for episode_path={episode_path}, frame_idx={frame_idx}"
+        )
+        
     def __getitem__(self, idx):
         item = self.base[idx]
         x = item["x"]  # (T,M,5,2)
+        episode_path = item["episode_path"]
 
         T_full = x.shape[0]
         if T_full < self.L:
@@ -98,4 +131,10 @@ class WindowedKeypointDataset(Dataset):
         obs = chunk[:self.O]              # (O, M, 5, 2)
         fut = chunk[self.O:]              # (P, M, 5, 2)
 
-        return {"obs": obs, "fut": fut}
+        frame_idx = start + self.O - 1
+        frame_path = self._get_frame_path(episode_path, frame_idx)
+
+        img = Image.open(frame_path).convert("RGB")
+        frame_tensor = self.img_transform(img)   # (3,224,224)
+        
+        return {"obs": obs, "fut": fut,  "frame": frame_tensor}

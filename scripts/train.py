@@ -8,7 +8,7 @@ from torch.optim import Adam
 
 from src.LSTM import LSTM_gat
 from src.GAT import GAT
-from src.model import FullModel
+from src.model import FullModelWithResNet
 from data.dataloader import KeypointDataset, WindowedKeypointDataset
 
 import glob
@@ -85,7 +85,7 @@ if Enable_WandB:
 
 # ----- build model -----
 encoder = LSTM_gat(hidden_size=128, embed_dim=64)
-model = FullModel(encoder, gat_out_dim=128).to(device)
+model = FullModelWithResNet(encoder).to(device)
 
 optimizer = Adam(model.parameters(), lr=lr)
 
@@ -168,72 +168,64 @@ def train_one_epoch(
     total, n = 0.0, 0
 
     for batch in dataloader:
-        obs_raw = batch["obs"].to(device).float()  # (B,O,M,5,2) with NaNs possible
-        fut_raw = batch["fut"].to(device).float()  # (B,P,M,5,2) with NaNs possible
+        obs_raw = batch["obs"].to(device).float()
+        fut_raw = batch["fut"].to(device).float()
+        frame   = batch["frame"].to(device).float()
 
-        # cleaned versions for feeding the model
         obs = torch.nan_to_num(obs_raw, nan=0.0)
         fut = torch.nan_to_num(fut_raw, nan=0.0)
 
-        # -------------------------
         # (A) Teacher-forced delta loss
-        # -------------------------
-        full_raw = torch.cat([obs_raw, fut_raw], dim=1)  # keep NaNs
+        full_raw = torch.cat([obs_raw, fut_raw], dim=1)
         gt_delta, mask_delta, full_delta_in, full_clean = _make_gt_and_mask(model, full_raw)
 
-        out_tf = model(full_delta_in)          # input is delta now
-        pred_mu_tf = _as_delta_pred(out_tf)    # (B,T-1,N,2)
+        out_tf = model(full_delta_in, frame)
+        pred_mu_tf = _as_delta_pred(out_tf)
         pred_delta_tf = pred_mu_tf
 
         delta_loss = ((pred_delta_tf - gt_delta) ** 2 * mask_delta).sum() / mask_delta.sum().clamp_min(1.0)
 
-        # -------------------------
-        # (B) Rollout absolute position loss (future only)
-        # -------------------------
-        fut_valid5 = torch.isfinite(fut_raw).all(dim=-1)            # (B,P,M,5)
-        gt_fut6 = model.encoder.add_virtual_root(fut_raw, fut_valid5)  # RAW + mask
+        # (B) Rollout absolute position loss
+        fut_valid5 = torch.isfinite(fut_raw).all(dim=-1)
+        gt_fut6 = model.encoder.add_virtual_root(fut_raw, fut_valid5)
 
-        root_valid = fut_valid5.any(dim=-1, keepdim=True)           # (B,P,M,1)
-        valid6 = torch.cat([fut_valid5, root_valid], dim=-1)        # (B,P,M,6) root LAST
+        root_valid = fut_valid5.any(dim=-1, keepdim=True)
+        valid6 = torch.cat([fut_valid5, root_valid], dim=-1)
         mask6 = valid6.unsqueeze(-1).expand(-1, -1, -1, -1, 2).float()
 
         B, _, M, _, _ = obs.shape
 
-        # Keep BOTH raw and clean windows, plus a validity window
-        seq_raw = obs_raw.clone()                                  # (B,O,M,5,2)
+        seq_raw = obs_raw.clone()
         seq_clean = obs.clone()
         seq_valid5 = torch.isfinite(seq_raw).all(dim=-1)
 
-        seq_delta = seq_clean[:, 1:] - seq_clean[:, :-1]          # (B,O-1,M,5,2)
+        seq_delta = seq_clean[:, 1:] - seq_clean[:, :-1]
         seq_delta_valid = seq_valid5[:, 1:] & seq_valid5[:, :-1]
         seq_delta = torch.where(seq_delta_valid.unsqueeze(-1), seq_delta, torch.zeros_like(seq_delta))
 
         preds6 = []
         for _step in range(P):
-            out = model(seq_delta)
-            mu = _as_delta_pred(out)                               # (B,O,N,2)
-            dposN = mu[:, -1]                                      # (B,N,2)
-            dpos6 = dposN.view(B, M, 6, 2)                         # (B,M,6,2)
+            out = model(seq_delta, frame)
+            mu = _as_delta_pred(out)
+            dposN = mu[:, -1]
+            dpos6 = dposN.view(B, M, 6, 2)
 
-            # last frame validity must come from RAW (not nan_to_num)
-            last5_raw = seq_raw[:, -1]                             # (B,M,5,2) may contain NaNs
-            last_valid5 = seq_valid5[:, -1]                        # (B,M,5)
+            last5_raw = seq_raw[:, -1]
+            last_valid5 = seq_valid5[:, -1]
             last6 = model.encoder.add_virtual_root(
                 last5_raw.unsqueeze(1), last_valid5.unsqueeze(1)
-            )[:, 0]                                                # (B,M,6,2)
+            )[:, 0]
 
-            next6 = last6 + dpos6                                  # (B,M,6,2)
-            next5 = next6[:, :, :5, :]                             # (B,M,5,2) predicted kp are finite
+            next6 = last6 + dpos6
+            next5 = next6[:, :, :5, :]
             next_valid5 = torch.ones((B, M, 5), device=device, dtype=torch.bool)
 
-            # recompute root consistently using mask
             next6 = model.encoder.add_virtual_root(
                 next5.unsqueeze(1), next_valid5.unsqueeze(1)
-            )[:, 0]                                                # (B,M,6,2)
+            )[:, 0]
 
             preds6.append(next6)
 
-            # slide all three windows
             seq_raw = torch.cat([seq_raw[:, 1:], next5.unsqueeze(1)], dim=1)
             seq_valid5 = torch.cat([seq_valid5[:, 1:], next_valid5.unsqueeze(1)], dim=1)
             seq_clean = torch.nan_to_num(seq_raw, nan=0.0)
@@ -242,13 +234,9 @@ def train_one_epoch(
             seq_delta_valid = seq_valid5[:, 1:] & seq_valid5[:, :-1]
             seq_delta = torch.where(seq_delta_valid.unsqueeze(-1), seq_delta, torch.zeros_like(seq_delta))
 
-        pred_fut6 = torch.stack(preds6, dim=1)                     # (B,P,M,6,2)
-
+        pred_fut6 = torch.stack(preds6, dim=1)
         pos_loss = (((pred_fut6 - gt_fut6) ** 2) * mask6).sum() / mask6.sum().clamp_min(1.0)
 
-        # -------------------------
-        # Combined loss
-        # -------------------------
         loss = w_pos * pos_loss + w_delta * delta_loss
         if torch.isnan(loss) or torch.isinf(loss):
             continue
@@ -276,21 +264,20 @@ def evaluate_one_epoch(
     for batch in dataloader:
         obs_raw = batch["obs"].to(device).float()
         fut_raw = batch["fut"].to(device).float()
+        frame   = batch["frame"].to(device).float()
 
         obs = torch.nan_to_num(obs_raw, nan=0.0)
         fut = torch.nan_to_num(fut_raw, nan=0.0)
 
-        # ---- teacher-forced delta loss ----
         full_raw = torch.cat([obs_raw, fut_raw], dim=1)
         gt_delta, mask_delta, full_delta_in, full_clean = _make_gt_and_mask(model, full_raw)
 
-        out_tf = model(full_delta_in)
+        out_tf = model(full_delta_in, frame)
         pred_mu_tf = _as_delta_pred(out_tf)
         pred_delta_tf = pred_mu_tf
 
         delta_loss = ((pred_delta_tf - gt_delta) ** 2 * mask_delta).sum() / mask_delta.sum().clamp_min(1.0)
 
-        # ---- rollout pos loss ----
         fut_valid5 = torch.isfinite(fut_raw).all(dim=-1)
         gt_fut6 = model.encoder.add_virtual_root(fut_raw, fut_valid5)
 
@@ -310,7 +297,7 @@ def evaluate_one_epoch(
 
         preds6 = []
         for _step in range(P):
-            out = model(seq_delta)
+            out = model(seq_delta, frame)
             mu = _as_delta_pred(out)
             dposN = mu[:, -1]
             dpos6 = dposN.view(B, M, 6, 2)
@@ -334,6 +321,10 @@ def evaluate_one_epoch(
             seq_raw = torch.cat([seq_raw[:, 1:], next5.unsqueeze(1)], dim=1)
             seq_valid5 = torch.cat([seq_valid5[:, 1:], next_valid5.unsqueeze(1)], dim=1)
             seq_clean = torch.nan_to_num(seq_raw, nan=0.0)
+
+            seq_delta = seq_clean[:, 1:] - seq_clean[:, :-1]
+            seq_delta_valid = seq_valid5[:, 1:] & seq_valid5[:, :-1]
+            seq_delta = torch.where(seq_delta_valid.unsqueeze(-1), seq_delta, torch.zeros_like(seq_delta))
 
         pred_fut6 = torch.stack(preds6, dim=1)
         pos_loss = (((pred_fut6 - gt_fut6) ** 2) * mask6).sum() / mask6.sum().clamp_min(1.0)
