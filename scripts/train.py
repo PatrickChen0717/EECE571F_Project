@@ -9,6 +9,7 @@ from torch.optim import Adam
 from src.LSTM import LSTM_gat
 from src.GAT import GAT
 from src.model import FullModelWithResNet
+from src.model import FullModelWithDINOv2
 from data.dataloader import KeypointDataset, WindowedKeypointDataset
 
 import glob
@@ -22,9 +23,9 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 # ----- fake dataset example -----
 SAVE_INTERVAL = 3
 NUM_EPOCHS = 150
-BATCH = 32
+BATCH = 64
 O = 30
-P = 30
+P = 15
 M = 2               # Number of instruments
 lr = 1e-3
 Enable_WandB = True
@@ -85,7 +86,8 @@ if Enable_WandB:
 
 # ----- build model -----
 encoder = LSTM_gat(hidden_size=128, embed_dim=64)
-model = FullModelWithResNet(encoder).to(device)
+# model = FullModelWithResNet(encoder, vision_dim=128).to(device)
+model = FullModelWithDINOv2(encoder, vision_dim=128).to(device)
 
 optimizer = Adam(model.parameters(), lr=lr)
 
@@ -170,7 +172,9 @@ def train_one_epoch(
     for batch in dataloader:
         obs_raw = batch["obs"].to(device).float()
         fut_raw = batch["fut"].to(device).float()
-        frame   = batch["frame"].to(device).float()
+
+        obs_frames  = batch["obs_frames"].to(device).float()    # (B,O-1,3,224,224)
+        full_frames = batch["full_frames"].to(device).float()   # (B,O+P-1,3,224,224)
 
         obs = torch.nan_to_num(obs_raw, nan=0.0)
         fut = torch.nan_to_num(fut_raw, nan=0.0)
@@ -179,7 +183,7 @@ def train_one_epoch(
         full_raw = torch.cat([obs_raw, fut_raw], dim=1)
         gt_delta, mask_delta, full_delta_in, full_clean = _make_gt_and_mask(model, full_raw)
 
-        out_tf = model(full_delta_in, frame)
+        out_tf = model(full_delta_in, full_frames)
         pred_mu_tf = _as_delta_pred(out_tf)
         pred_delta_tf = pred_mu_tf
 
@@ -203,9 +207,11 @@ def train_one_epoch(
         seq_delta_valid = seq_valid5[:, 1:] & seq_valid5[:, :-1]
         seq_delta = torch.where(seq_delta_valid.unsqueeze(-1), seq_delta, torch.zeros_like(seq_delta))
 
+        seq_frames = obs_frames.clone()   # (B,O-1,3,224,224)
+
         preds6 = []
         for _step in range(P):
-            out = model(seq_delta, frame)
+            out = model(seq_delta, seq_frames)
             mu = _as_delta_pred(out)
             dposN = mu[:, -1]
             dpos6 = dposN.view(B, M, 6, 2)
@@ -233,6 +239,10 @@ def train_one_epoch(
             seq_delta = seq_clean[:, 1:] - seq_clean[:, :-1]
             seq_delta_valid = seq_valid5[:, 1:] & seq_valid5[:, :-1]
             seq_delta = torch.where(seq_delta_valid.unsqueeze(-1), seq_delta, torch.zeros_like(seq_delta))
+
+            # keep frame-window length aligned with seq_delta
+            last_frame = seq_frames[:, -1:].clone()
+            seq_frames = torch.cat([seq_frames[:, 1:], last_frame], dim=1)
 
         pred_fut6 = torch.stack(preds6, dim=1)
         pos_loss = (((pred_fut6 - gt_fut6) ** 2) * mask6).sum() / mask6.sum().clamp_min(1.0)
@@ -264,7 +274,8 @@ def evaluate_one_epoch(
     for batch in dataloader:
         obs_raw = batch["obs"].to(device).float()
         fut_raw = batch["fut"].to(device).float()
-        frame   = batch["frame"].to(device).float()
+        obs_frames  = batch["obs_frames"].to(device).float()
+        full_frames = batch["full_frames"].to(device).float()
 
         obs = torch.nan_to_num(obs_raw, nan=0.0)
         fut = torch.nan_to_num(fut_raw, nan=0.0)
@@ -272,7 +283,7 @@ def evaluate_one_epoch(
         full_raw = torch.cat([obs_raw, fut_raw], dim=1)
         gt_delta, mask_delta, full_delta_in, full_clean = _make_gt_and_mask(model, full_raw)
 
-        out_tf = model(full_delta_in, frame)
+        out_tf = model(full_delta_in, full_frames)
         pred_mu_tf = _as_delta_pred(out_tf)
         pred_delta_tf = pred_mu_tf
 
@@ -296,8 +307,9 @@ def evaluate_one_epoch(
         seq_delta = torch.where(seq_delta_valid.unsqueeze(-1), seq_delta, torch.zeros_like(seq_delta))
 
         preds6 = []
+        seq_frames = obs_frames.clone()
         for _step in range(P):
-            out = model(seq_delta, frame)
+            out = model(seq_delta, seq_frames)
             mu = _as_delta_pred(out)
             dposN = mu[:, -1]
             dpos6 = dposN.view(B, M, 6, 2)
@@ -325,6 +337,8 @@ def evaluate_one_epoch(
             seq_delta = seq_clean[:, 1:] - seq_clean[:, :-1]
             seq_delta_valid = seq_valid5[:, 1:] & seq_valid5[:, :-1]
             seq_delta = torch.where(seq_delta_valid.unsqueeze(-1), seq_delta, torch.zeros_like(seq_delta))
+            last_frame = seq_frames[:, -1:].clone()
+            seq_frames = torch.cat([seq_frames[:, 1:], last_frame], dim=1)
 
         pred_fut6 = torch.stack(preds6, dim=1)
         pos_loss = (((pred_fut6 - gt_fut6) ** 2) * mask6).sum() / mask6.sum().clamp_min(1.0)

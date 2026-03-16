@@ -115,26 +115,53 @@ class WindowedKeypointDataset(Dataset):
         raise FileNotFoundError(
             f"Could not find frame for episode_path={episode_path}, frame_idx={frame_idx}"
         )
+    
+    def _load_frame_tensor(self, episode_path, frame_idx):
+        frame_path = self._get_frame_path(episode_path, frame_idx)
+        img = Image.open(frame_path).convert("RGB")
+        return self.img_transform(img)   # (3,224,224)
+
+
+    def _load_frame_sequence(self, episode_path, start_idx, length):
+        frames = []
+        for idx in range(start_idx, start_idx + length):
+            frames.append(self._load_frame_tensor(episode_path, idx))
+        return torch.stack(frames, dim=0)   # (T,3,224,224)
         
     def __getitem__(self, idx):
-        item = self.base[idx]
-        x = item["x"]  # (T,M,5,2)
-        episode_path = item["episode_path"]
+        sample = self.base[idx]
 
-        T_full = x.shape[0]
-        if T_full < self.L:
-            raise RuntimeError(f"Sequence too short: {T_full} < {self.L}")
+        x = sample["x"]                 # (L,M,5,2)
+        episode_path = sample["episode_path"]
 
-        start = torch.randint(0, T_full - self.L + 1, (1,)).item() if self.random_window else 0
+        L = x.shape[0]
 
-        chunk = x[start:start + self.L]   # (O+P, M, 5, 2)
-        obs = chunk[:self.O]              # (O, M, 5, 2)
-        fut = chunk[self.O:]              # (P, M, 5, 2)
+        if self.random_window:
+            start = np.random.randint(0, L - (self.O + self.P) + 1)
+        else:
+            start = 0   # or your current deterministic logic
 
-        frame_idx = start + self.O - 1
-        frame_path = self._get_frame_path(episode_path, frame_idx)
+        obs = x[start:start + self.O]
+        fut = x[start + self.O:start + self.O + self.P]
 
-        img = Image.open(frame_path).convert("RGB")
-        frame_tensor = self.img_transform(img)   # (3,224,224)
+        obs_frames = self._load_frame_sequence(
+            episode_path=episode_path,
+            start_idx=start + 1,
+            length=self.O - 1
+        )
+
+        full_frames = self._load_frame_sequence(
+            episode_path=episode_path,
+            start_idx=start + 1,
+            length=self.O + self.P - 1
+        )
+
+        return {
+            "obs": torch.as_tensor(obs).float(),
+            "fut": torch.as_tensor(fut).float(),
+            "obs_frames": obs_frames.float(),
+            "full_frames": full_frames.float(),
+            "episode_path": episode_path,
+            "start_idx": start,
+        }
         
-        return {"obs": obs, "fut": fut,  "frame": frame_tensor}
