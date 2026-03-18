@@ -27,7 +27,7 @@ img_transform = transforms.Compose([
     )
 ])
 
-ckpt = "models/model_weights_2026-03-12_13-18-26/epoch74.pth"
+ckpt = "models/model_weights_2026-03-18_01-18-07/epoch98.pth"
 model.load_state_dict(torch.load(ckpt, map_location=device))
 model.eval()
 
@@ -40,7 +40,7 @@ print("Learnable parameters:", lp)
 
 # ----- dataset -----
 paths_left = glob.glob(
-    r"C:\Users\Patrick\Documents\eece571F\SurgPose_dataset\**\keypoints_left.yaml",
+    r"E:\EECE571F\SurgPose_dataset\**\keypoints_left.yaml",
     recursive=True
 )
 yaml_paths = paths_left
@@ -168,7 +168,7 @@ def predict_episode_blockwise_no_overlap(model, x_full, episode_path, O=30, P=10
             break
 
         frame_idx = t + O - 1
-        frame = load_frame_tensor(episode_path, frame_idx, device=device)
+        frame = load_frame_tensor(episode_path, frame_idx, device=device)   # (1,3,224,224)
 
         seq_clean = torch.nan_to_num(obs5_raw, nan=0.0)
         seq_valid5 = torch.isfinite(obs5_raw).all(dim=-1)
@@ -186,7 +186,11 @@ def predict_episode_blockwise_no_overlap(model, x_full, episode_path, O=30, P=10
 
             win_in = win_delta.unsqueeze(0).to(device)  # (1,O-1,M,5,2)
 
-            out = model(win_in, frame)
+            # new model expects frame sequence: (B,T,3,224,224)
+            T = win_in.shape[1]
+            frame_seq = frame.unsqueeze(1).repeat(1, T, 1, 1, 1)  # (1,T,3,224,224)
+
+            out = model(win_in, frame_seq)
             mu = _mu_from_model_out(out)
             dposN = mu[0, -1].detach().cpu()
             dpos6 = dposN.view(M, 6, 2)
@@ -296,4 +300,4 @@ sample = {}
 for k, v in batch.items():
     sample[k] = v[i]
 
-plot_full_episode(model, sample, device=device, instr_id=0, kp_id=4, O=O)
+plot_full_episode(model, sample, device=device, instr_id=1, kp_id=4, O=O)
