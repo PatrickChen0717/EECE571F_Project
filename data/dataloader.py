@@ -1,23 +1,14 @@
 import os
 import yaml
-import cv2
 import numpy as np
 import torch
 from torch.utils.data import Dataset
-
-import yaml, numpy as np, torch
-from torch.utils.data import Dataset
 from PIL import Image
 from torchvision import transforms
+from decord import VideoReader, cpu
 
 
 def load_yaml_episode(yaml_path: str, groups):
-    """
-    groups: list[list[int]] e.g. [[1,2,3,4,5], [8,9,10,11,12]]
-    returns:
-      kpts: (T, M, K, 2)
-      groups: same groups
-    """
     with open(yaml_path, "r") as f:
         data = yaml.safe_load(f)
 
@@ -25,7 +16,7 @@ def load_yaml_episode(yaml_path: str, groups):
     T = len(frame_keys)
     M = len(groups)
     K = len(groups[0])
-    assert all(len(g) == K for g in groups), "All groups must have same K"
+    assert all(len(g) == K for g in groups)
 
     kpts = np.full((T, M, K, 2), np.nan, dtype=np.float32)
 
@@ -41,10 +32,11 @@ def load_yaml_episode(yaml_path: str, groups):
 
     return kpts, groups
 
+
 class KeypointDataset(Dataset):
     def __init__(self, yaml_paths, normalize=False):
         self.yaml_paths = list(yaml_paths)
-        self.groups = [[1,2,3,4,5], [8,9,10,11,12]]  # default PSM1 + PSM3
+        self.groups = [[1, 2, 3, 4, 5], [8, 9, 10, 11, 12]]
         self.normalize = normalize
 
         self.mean = None
@@ -52,7 +44,7 @@ class KeypointDataset(Dataset):
         if normalize:
             all_xy = []
             for p in self.yaml_paths:
-                kpts, _ = load_yaml_episode(p, self.groups)   # (T,M,K,2)
+                kpts, _ = load_yaml_episode(p, self.groups)
                 all_xy.append(kpts.reshape(-1, 2))
             all_xy = np.concatenate(all_xy, axis=0)
             self.mean = np.nanmean(all_xy, axis=0).astype(np.float32)
@@ -63,17 +55,17 @@ class KeypointDataset(Dataset):
 
     def __getitem__(self, idx):
         path = self.yaml_paths[idx]
-        x, groups = load_yaml_episode(path, self.groups)  # (T,M,5,2)
+        x, _ = load_yaml_episode(path, self.groups)
 
         if self.normalize:
             x = (x - self.mean) / self.std
 
         return {
-            "x": torch.from_numpy(x).float(),  # (T,M,5,2)
+            "x": torch.from_numpy(x).float(),
             "length": torch.tensor(x.shape[0]),
             "episode_path": path,
         }
-        
+
 
 class WindowedKeypointDataset(Dataset):
     def __init__(self, base_subset, O=10, P=5, random_window=True, img_transform=None):
@@ -82,8 +74,7 @@ class WindowedKeypointDataset(Dataset):
         self.P = P
         self.L = O + P
         self.random_window = random_window
-        
-        
+
         self.img_transform = img_transform or transforms.Compose([
             transforms.Resize((224, 224)),
             transforms.ToTensor(),
@@ -93,53 +84,66 @@ class WindowedKeypointDataset(Dataset):
             )
         ])
 
+        self._vr_cache = {}
 
     def __len__(self):
         return len(self.base)
 
-    def _get_frame_path(self, episode_path, frame_idx):
-        """
-        Modify this function to match your actual dataset structure.
+    def _get_video_path(self, episode_path):
+        # split path
+        parts = episode_path.split(os.sep)
 
-        Example assumption:
-        - YAML path: .../keypoints_left.yaml
-        - Image path: .../left_frames/000123.png
-        or       : .../images_left/000123.png
-        """
-        episode_dir = os.path.dirname(episode_path)
+        # remove filename and append video path
+        parts = parts[:-1] + ["regular", "left_video.mp4"]
 
-        candidate = os.path.join(episode_dir, "regular/left_frames", f"{frame_idx:06d}.png")
-        if os.path.exists(candidate):
-            return candidate
+        video_path = os.sep.join(parts)
 
-        raise FileNotFoundError(
-            f"Could not find frame for episode_path={episode_path}, frame_idx={frame_idx}"
-        )
-    
+        if not os.path.exists(video_path):
+            raise FileNotFoundError(video_path)
+
+        return video_path
+
+    def _get_video_reader(self, episode_path):
+        video_path = self._get_video_path(episode_path)
+        if video_path not in self._vr_cache:
+            self._vr_cache[video_path] = VideoReader(video_path, ctx=cpu(0))
+        return self._vr_cache[video_path]
+
     def _load_frame_tensor(self, episode_path, frame_idx):
-        frame_path = self._get_frame_path(episode_path, frame_idx)
-        img = Image.open(frame_path).convert("RGB")
-        return self.img_transform(img)   # (3,224,224)
+        vr = self._get_video_reader(episode_path)
 
+        if frame_idx < 0 or frame_idx >= len(vr):
+            raise IndexError(f"frame_idx={frame_idx} out of range for video {self._get_video_path(episode_path)}")
+
+        frame_np = vr[frame_idx].asnumpy()   # HWC RGB uint8
+        img = Image.fromarray(frame_np)
+        return self.img_transform(img)
 
     def _load_frame_sequence(self, episode_path, start_idx, length):
-        frames = []
-        for idx in range(start_idx, start_idx + length):
-            frames.append(self._load_frame_tensor(episode_path, idx))
+        vr = self._get_video_reader(episode_path)
+        indices = list(range(start_idx, start_idx + length))
+
+        if max(indices) >= len(vr):
+            raise IndexError(f"Requested frames {indices[-1]} but video length is {len(vr)}")
+
+        batch = vr.get_batch(indices).asnumpy()   # (T,H,W,3)
+        frames = [self.img_transform(Image.fromarray(arr)) for arr in batch]
         return torch.stack(frames, dim=0)   # (T,3,224,224)
-        
+
     def __getitem__(self, idx):
         sample = self.base[idx]
 
-        x = sample["x"]                 # (L,M,5,2)
+        x = sample["x"]
         episode_path = sample["episode_path"]
-
         L = x.shape[0]
 
+        if L < self.L:
+            raise RuntimeError(f"Sequence too short: {L} < {self.L}")
+
         if self.random_window:
-            start = np.random.randint(0, L - (self.O + self.P) + 1)
+            start = np.random.randint(0, L - self.L + 1)
         else:
-            start = 0   # or your current deterministic logic
+            start = 0
 
         obs = x[start:start + self.O]
         fut = x[start + self.O:start + self.O + self.P]
@@ -156,12 +160,17 @@ class WindowedKeypointDataset(Dataset):
             length=self.O + self.P - 1
         )
 
+        last_obs_frame = self._load_frame_tensor(
+            episode_path=episode_path,
+            frame_idx=start + self.O - 1
+        )
+
         return {
             "obs": torch.as_tensor(obs).float(),
             "fut": torch.as_tensor(fut).float(),
             "obs_frames": obs_frames.float(),
             "full_frames": full_frames.float(),
+            "frame": last_obs_frame.float(),
             "episode_path": episode_path,
             "start_idx": start,
         }
-        

@@ -11,12 +11,22 @@ class FullModelWithResNet(nn.Module):
 
         Dgat = traj_encoder.gat_out_dim
 
-        self.fuse = nn.Sequential(
+        self.fuse_in = nn.Sequential(
             nn.Linear(Dgat + vision_dim, fuse_dim),
             nn.ReLU(),
+        )
+
+        self.post_gru = nn.GRU(
+            input_size=fuse_dim,
+            hidden_size=fuse_dim,
+            num_layers=1,
+            batch_first=True
+        )
+
+        self.head = nn.Sequential(
             nn.Linear(fuse_dim, fuse_dim),
             nn.ReLU(),
-            nn.Linear(fuse_dim, 2)   # predict delta x,y per node
+            nn.Linear(fuse_dim, 2)
         )
 
     def forward(self, delta, frame):
@@ -88,6 +98,14 @@ class FullModelWithDINOv2(nn.Module):
         vis = torch.cat(feats, dim=-1)               # (B,T,Dv)
         vis = vis[:, :, None, :].expand(B, T, N, vis.shape[-1])
 
-        fused = torch.cat([rhat, vis], dim=-1)       # (B,T,N,*)
-        out = self.fuse(fused)                       # (B,T,N,2)
+        fused = torch.cat([rhat, vis], dim=-1)        # (B,T,N,Dgat+vision_dim)
+        fused = self.fuse_in(fused)                   # (B,T,N,fuse_dim)
+
+        B, T, N, F = fused.shape
+        fused = fused.permute(0, 2, 1, 3).contiguous().view(B * N, T, F)
+
+        fused_out, _ = self.post_gru(fused)
+        out = self.head(fused_out)
+
+        out = out.view(B, N, T, 2).permute(0, 2, 1, 3).contiguous()
         return out
