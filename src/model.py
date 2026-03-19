@@ -11,19 +11,9 @@ class FullModelWithResNet(nn.Module):
 
         Dgat = traj_encoder.gat_out_dim
 
-        self.fuse_in = nn.Sequential(
+        self.fuse = nn.Sequential(
             nn.Linear(Dgat + vision_dim, fuse_dim),
             nn.ReLU(),
-        )
-
-        self.post_gru = nn.GRU(
-            input_size=fuse_dim,
-            hidden_size=fuse_dim,
-            num_layers=1,
-            batch_first=True
-        )
-
-        self.head = nn.Sequential(
             nn.Linear(fuse_dim, fuse_dim),
             nn.ReLU(),
             nn.Linear(fuse_dim, 2)
@@ -62,11 +52,21 @@ class FullModelWithDINOv2(nn.Module):
         )
 
         Dgat = traj_encoder.gat_out_dim
-        in_dim = Dgat + vision_dim + (vision_dim if use_visual_diff else 0)
+        vis_dim = vision_dim * 2 if self.use_visual_diff else vision_dim
 
-        self.fuse = nn.Sequential(
-            nn.Linear(in_dim, fuse_dim),
+        self.fuse_in = nn.Sequential(
+            nn.Linear(Dgat + vis_dim, fuse_dim),
             nn.ReLU(),
+        )
+
+        self.post_gru = nn.GRU(
+            input_size=fuse_dim,
+            hidden_size=fuse_dim,
+            num_layers=1,
+            batch_first=True
+        )
+
+        self.head = nn.Sequential(
             nn.Linear(fuse_dim, fuse_dim),
             nn.ReLU(),
             nn.Linear(fuse_dim, 2)
