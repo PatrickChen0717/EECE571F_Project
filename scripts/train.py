@@ -23,14 +23,14 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 # ----- fake dataset example -----
 SAVE_INTERVAL = 3
 NUM_EPOCHS = 150
-BATCH = 64
+BATCH = 32
 O = 30
 P = 15
 M = 2               # Number of instruments
 lr = 1e-3
 Enable_WandB = True
 
-paths_left = glob.glob(r"E:\EECE571F\SurgPose_dataset\**\keypoints_left.yaml", recursive=True)
+paths_left = glob.glob(r"C:\Users\Patrick\Documents\eece571F\SurgPose_dataset\**\keypoints_left.yaml", recursive=True)
 # paths_right = glob.glob(r"C:\Users\Patrick\Documents\eece571F\SurgPose_dataset\**\keypoints_right.yaml", recursive=True)
 
 yaml_paths = paths_left
@@ -145,7 +145,7 @@ def _make_gt_and_mask(model, pos_raw):
 
     # GT delta on 6 nodes
     gt_delta = pos6[:, 1:] - pos6[:, :-1]                       # (B,T-1,M,6,2)
-    gt_delta = gt_delta.reshape(gt_delta.size(0), gt_delta.size(1), -1, 2)
+    gt_delta = gt_delta.reshape(gt_delta.size(0), gt_delta.size(1), -1, 3)
 
     # delta-input for model on original 5 keypoints
     delta_in = pos_clean[:, 1:] - pos_clean[:, :-1]             # (B,T-1,M,5,2)
@@ -156,7 +156,7 @@ def _make_gt_and_mask(model, pos_raw):
     root_valid_dt = root_valid_t[:, 1:] & root_valid_t[:, :-1]  # (B,T-1,M)
 
     valid_delta6 = torch.cat([valid_delta5, root_valid_dt.unsqueeze(-1)], dim=-1)
-    mask = valid_delta6.unsqueeze(-1).expand(-1, -1, -1, -1, 2).float()
+    mask = valid_delta6.unsqueeze(-1).expand(-1, -1, -1, -1, 3).float()
     mask = mask.reshape(mask.size(0), mask.size(1), -1, 2)
 
     return gt_delta, mask, delta_in, pos_clean
@@ -195,7 +195,7 @@ def train_one_epoch(
 
         root_valid = fut_valid5.any(dim=-1, keepdim=True)
         valid6 = torch.cat([fut_valid5, root_valid], dim=-1)
-        mask6 = valid6.unsqueeze(-1).expand(-1, -1, -1, -1, 2).float()
+        mask6 = valid6.unsqueeze(-1).expand(-1, -1, -1, -1, 3).float()
 
         B, _, M, _, _ = obs.shape
 
@@ -294,7 +294,7 @@ def evaluate_one_epoch(
 
         root_valid = fut_valid5.any(dim=-1, keepdim=True)
         valid6 = torch.cat([fut_valid5, root_valid], dim=-1)
-        mask6 = valid6.unsqueeze(-1).expand(-1, -1, -1, -1, 2).float()
+        mask6 = valid6.unsqueeze(-1).expand(-1, -1, -1, -1, 3).float()
 
         B, _, M, _, _ = obs.shape
 

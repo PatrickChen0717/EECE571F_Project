@@ -13,7 +13,7 @@ class LSTM_gat(nn.Module):
 
         # Φ embedding
         self.phi = nn.Sequential(
-            nn.Linear(2, embed_dim),
+            nn.Linear(3, embed_dim),
             nn.ReLU(),
             nn.Linear(embed_dim, embed_dim)
         )
@@ -68,7 +68,7 @@ class LSTM_gat(nn.Module):
 
     def forward(self, delta):
         """
-        delta: (B, T, M, K, 2)
+        delta: (B, T, M, K, 3)
             precomputed delta positions
         returns:
         r:    (B, T, N, Dlstm)

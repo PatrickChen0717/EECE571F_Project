@@ -27,7 +27,7 @@ img_transform = transforms.Compose([
     )
 ])
 
-ckpt = "models/model_weights_2026-03-18_01-18-07/epoch98.pth"
+ckpt = "models/model_weights_2026-03-19_16-30-22/epoch26.pth"
 model.load_state_dict(torch.load(ckpt, map_location=device))
 model.eval()
 
@@ -40,7 +40,7 @@ print("Learnable parameters:", lp)
 
 # ----- dataset -----
 paths_left = glob.glob(
-    r"E:\EECE571F\SurgPose_dataset\**\keypoints_left.yaml",
+    r"C:\Users\Patrick\Documents\eece571F\SurgPose_dataset\**\keypoints_left.yaml",
     recursive=True
 )
 yaml_paths = paths_left

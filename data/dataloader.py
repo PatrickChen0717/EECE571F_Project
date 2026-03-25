@@ -18,7 +18,7 @@ def load_yaml_episode(yaml_path: str, groups):
     K = len(groups[0])
     assert all(len(g) == K for g in groups)
 
-    kpts = np.full((T, M, K, 2), np.nan, dtype=np.float32)
+    kpts = np.full((T, M, K, 3), np.nan, dtype=np.float32)
 
     for t, fk in enumerate(frame_keys):
         frame_dict = data[fk]
@@ -29,6 +29,7 @@ def load_yaml_episode(yaml_path: str, groups):
                     continue
                 kpts[t, m, j, 0] = float(kp[0])
                 kpts[t, m, j, 1] = float(kp[1])
+                kpts[t, m, j, 2] = float(kp[2])
 
     return kpts, groups
 
