@@ -14,6 +14,7 @@ from data.dataloader import KeypointDataset, WindowedKeypointDataset
 
 import glob
 import numpy as np
+from tqdm import tqdm
 
 import wandb
 wandb.login(key="8b49b325ce8e9e788b2981b63eebbc01ee33bc6b")
@@ -23,7 +24,7 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 # ----- fake dataset example -----
 SAVE_INTERVAL = 3
 NUM_EPOCHS = 150
-BATCH = 32
+BATCH = 64
 O = 30
 P = 15
 M = 2               # Number of instruments
@@ -42,7 +43,9 @@ if len(yaml_paths) == 0:
 
 ds = KeypointDataset(
     yaml_paths=yaml_paths,
-    normalize=False
+    normalize=False,
+    smoothing=True,
+    smoothing_window=5
 )
 
 # 80 / 20 split
@@ -56,8 +59,8 @@ train_base, test_base = random_split(
     generator=torch.Generator().manual_seed(42)
 )
 
-train_set = WindowedKeypointDataset(train_base, O=O, P=P, random_window=True)
-test_set  = WindowedKeypointDataset(test_base,  O=O, P=P, random_window=False)
+train_set = WindowedKeypointDataset(train_base, O=O, P=P, random_window=False, load_from_image=False)
+test_set  = WindowedKeypointDataset(test_base,  O=O, P=P, random_window=False, load_from_image=False)
 print("num train_set:", len(train_set))
 print("num test_set:", len(test_set))
 train_dl = DataLoader(train_set, batch_size=BATCH, shuffle=True)
@@ -129,34 +132,42 @@ def _make_input_delta(model, pos_raw):
 
 def _make_gt_and_mask(model, pos_raw):
     """
-    pos_raw: (B,T,M,5,2) absolute positions with NaNs possible
+    pos_raw: (B,T,M,5,2)
 
     returns:
       gt_delta:  (B,T-1,N,2)
       mask:      (B,T-1,N,2)
-      delta_in:  (B,T-1,M,5,2)   model input
+      delta_in:  (B,T-1,M,5,2)
       pos_clean: (B,T,M,5,2)
     """
-    valid_xy = torch.isfinite(pos_raw).all(dim=-1)              # (B,T,M,5)
-    pos_clean = torch.nan_to_num(pos_raw, nan=0.0)
+    valid_xy = torch.isfinite(pos_raw).all(dim=-1)          # (B,T,M,5)
+    pos_clean = torch.nan_to_num(pos_raw, nan=0.0)          # (B,T,M,5,2)
 
-    # absolute positions with root
-    pos6 = model.encoder.add_virtual_root(pos_raw, valid_xy)    # (B,T,M,6,2)
+    feat = torch.cat([
+        pos_clean,
+        valid_xy.unsqueeze(-1).float()
+    ], dim=-1)                                              # (B,T,M,5,3)
 
-    # GT delta on 6 nodes
-    gt_delta = pos6[:, 1:] - pos6[:, :-1]                       # (B,T-1,M,6,2)
-    gt_delta = gt_delta.reshape(gt_delta.size(0), gt_delta.size(1), -1, 3)
+    pos6_feat = model.encoder.add_virtual_root(feat)        # (B,T,M,6,3)
+    pos6 = pos6_feat[..., :2]                               # (B,T,M,6,2)
 
-    # delta-input for model on original 5 keypoints
-    delta_in = pos_clean[:, 1:] - pos_clean[:, :-1]             # (B,T-1,M,5,2)
-    valid_delta5 = valid_xy[:, 1:] & valid_xy[:, :-1]           # (B,T-1,M,5)
-    delta_in = torch.where(valid_delta5.unsqueeze(-1), delta_in, torch.zeros_like(delta_in))
+    gt_delta = pos6[:, 1:] - pos6[:, :-1]                   # (B,T-1,M,6,2)
+    gt_delta = gt_delta.reshape(gt_delta.size(0), gt_delta.size(1), -1, 2)
 
-    root_valid_t = valid_xy.any(dim=-1)                         # (B,T,M)
-    root_valid_dt = root_valid_t[:, 1:] & root_valid_t[:, :-1]  # (B,T-1,M)
+    delta_xy = pos_clean[:, 1:] - pos_clean[:, :-1]         # (B,T-1,M,5,2)
+    valid_delta5 = valid_xy[:, 1:] & valid_xy[:, :-1]       # (B,T-1,M,5)
+    delta_xy = torch.where(valid_delta5.unsqueeze(-1), delta_xy, torch.zeros_like(delta_xy))
 
-    valid_delta6 = torch.cat([valid_delta5, root_valid_dt.unsqueeze(-1)], dim=-1)
-    mask = valid_delta6.unsqueeze(-1).expand(-1, -1, -1, -1, 3).float()
+    delta_in = torch.cat([
+        delta_xy,
+        valid_delta5.unsqueeze(-1).float()
+    ], dim=-1)            
+
+    root_valid_t = valid_xy.any(dim=-1)                     # (B,T,M)
+    root_valid_dt = root_valid_t[:, 1:] & root_valid_t[:, :-1]   # (B,T-1,M)
+
+    valid_delta6 = torch.cat([valid_delta5, root_valid_dt.unsqueeze(-1)], dim=-1)  # (B,T-1,M,6)
+    mask = valid_delta6.unsqueeze(-1).expand(-1, -1, -1, -1, 2).float()
     mask = mask.reshape(mask.size(0), mask.size(1), -1, 2)
 
     return gt_delta, mask, delta_in, pos_clean
@@ -169,7 +180,9 @@ def train_one_epoch(
     model.train()
     total, n = 0.0, 0
 
-    for batch in dataloader:
+    pbar = tqdm(dataloader, desc="Train", leave=False)
+    
+    for batch in pbar:
         obs_raw = batch["obs"].to(device).float()
         fut_raw = batch["fut"].to(device).float()
 
@@ -191,11 +204,17 @@ def train_one_epoch(
 
         # (B) Rollout absolute position loss
         fut_valid5 = torch.isfinite(fut_raw).all(dim=-1)
-        gt_fut6 = model.encoder.add_virtual_root(fut_raw, fut_valid5)
+        fut_clean = torch.nan_to_num(fut_raw, nan=0.0)
+        fut_feat = torch.cat([
+            fut_clean,
+            fut_valid5.unsqueeze(-1).float()
+        ], dim=-1)   # (B,P,M,5,3)
+
+        gt_fut6 = model.encoder.add_virtual_root(fut_feat)[..., :2]
 
         root_valid = fut_valid5.any(dim=-1, keepdim=True)
         valid6 = torch.cat([fut_valid5, root_valid], dim=-1)
-        mask6 = valid6.unsqueeze(-1).expand(-1, -1, -1, -1, 3).float()
+        mask6 = valid6.unsqueeze(-1).expand(-1, -1, -1, -1, 2).float()
 
         B, _, M, _, _ = obs.shape
 
@@ -203,9 +222,14 @@ def train_one_epoch(
         seq_clean = obs.clone()
         seq_valid5 = torch.isfinite(seq_raw).all(dim=-1)
 
-        seq_delta = seq_clean[:, 1:] - seq_clean[:, :-1]
+        seq_delta_xy = seq_clean[:, 1:] - seq_clean[:, :-1]
         seq_delta_valid = seq_valid5[:, 1:] & seq_valid5[:, :-1]
-        seq_delta = torch.where(seq_delta_valid.unsqueeze(-1), seq_delta, torch.zeros_like(seq_delta))
+        seq_delta_xy = torch.where(seq_delta_valid.unsqueeze(-1), seq_delta_xy, torch.zeros_like(seq_delta_xy))
+
+        seq_delta = torch.cat([
+            seq_delta_xy,
+            seq_delta_valid.unsqueeze(-1).float()
+        ], dim=-1)   # (B,O-1,M,5,3)
 
         seq_frames = obs_frames.clone()   # (B,O-1,3,224,224)
 
@@ -218,17 +242,24 @@ def train_one_epoch(
 
             last5_raw = seq_raw[:, -1]
             last_valid5 = seq_valid5[:, -1]
-            last6 = model.encoder.add_virtual_root(
-                last5_raw.unsqueeze(1), last_valid5.unsqueeze(1)
-            )[:, 0]
+            last5_clean = torch.nan_to_num(last5_raw, nan=0.0)
+            last_feat = torch.cat([
+                last5_clean.unsqueeze(1),
+                last_valid5.unsqueeze(1).unsqueeze(-1).float()
+            ], dim=-1)
+
+            last6 = model.encoder.add_virtual_root(last_feat)[:, 0, ..., :2]
 
             next6 = last6 + dpos6
             next5 = next6[:, :, :5, :]
             next_valid5 = torch.ones((B, M, 5), device=device, dtype=torch.bool)
 
-            next6 = model.encoder.add_virtual_root(
-                next5.unsqueeze(1), next_valid5.unsqueeze(1)
-            )[:, 0]
+            next_feat = torch.cat([
+                next5.unsqueeze(1),
+                next_valid5.unsqueeze(1).unsqueeze(-1).float()
+            ], dim=-1)
+
+            next6 = model.encoder.add_virtual_root(next_feat)[:, 0, ..., :2]
 
             preds6.append(next6)
 
@@ -236,9 +267,14 @@ def train_one_epoch(
             seq_valid5 = torch.cat([seq_valid5[:, 1:], next_valid5.unsqueeze(1)], dim=1)
             seq_clean = torch.nan_to_num(seq_raw, nan=0.0)
 
-            seq_delta = seq_clean[:, 1:] - seq_clean[:, :-1]
+            seq_delta_xy = seq_clean[:, 1:] - seq_clean[:, :-1]
             seq_delta_valid = seq_valid5[:, 1:] & seq_valid5[:, :-1]
-            seq_delta = torch.where(seq_delta_valid.unsqueeze(-1), seq_delta, torch.zeros_like(seq_delta))
+            seq_delta_xy = torch.where(seq_delta_valid.unsqueeze(-1), seq_delta_xy, torch.zeros_like(seq_delta_xy))
+
+            seq_delta = torch.cat([
+                seq_delta_xy,
+                seq_delta_valid.unsqueeze(-1).float()
+            ], dim=-1)
 
             # keep frame-window length aligned with seq_delta
             last_frame = seq_frames[:, -1:].clone()
@@ -270,8 +306,10 @@ def evaluate_one_epoch(
     model.eval()
     total, n = 0.0, 0
     total_pos, total_delta = 0.0, 0.0
-
-    for batch in dataloader:
+    
+    pbar = tqdm(dataloader, desc="Eval", leave=False)
+     
+    for batch in pbar:
         obs_raw = batch["obs"].to(device).float()
         fut_raw = batch["fut"].to(device).float()
         obs_frames  = batch["obs_frames"].to(device).float()
@@ -290,11 +328,17 @@ def evaluate_one_epoch(
         delta_loss = ((pred_delta_tf - gt_delta) ** 2 * mask_delta).sum() / mask_delta.sum().clamp_min(1.0)
 
         fut_valid5 = torch.isfinite(fut_raw).all(dim=-1)
-        gt_fut6 = model.encoder.add_virtual_root(fut_raw, fut_valid5)
+        fut_clean = torch.nan_to_num(fut_raw, nan=0.0)
+        fut_feat = torch.cat([
+            fut_clean,
+            fut_valid5.unsqueeze(-1).float()
+        ], dim=-1)                     # (B,P,M,5,3)
+
+        gt_fut6 = model.encoder.add_virtual_root(fut_feat)[..., :2]
 
         root_valid = fut_valid5.any(dim=-1, keepdim=True)
         valid6 = torch.cat([fut_valid5, root_valid], dim=-1)
-        mask6 = valid6.unsqueeze(-1).expand(-1, -1, -1, -1, 3).float()
+        mask6 = valid6.unsqueeze(-1).expand(-1, -1, -1, -1, 2).float()
 
         B, _, M, _, _ = obs.shape
 
@@ -302,9 +346,14 @@ def evaluate_one_epoch(
         seq_clean = obs.clone()
         seq_valid5 = torch.isfinite(seq_raw).all(dim=-1)
 
-        seq_delta = seq_clean[:, 1:] - seq_clean[:, :-1]
+        seq_delta_xy = seq_clean[:, 1:] - seq_clean[:, :-1]
         seq_delta_valid = seq_valid5[:, 1:] & seq_valid5[:, :-1]
-        seq_delta = torch.where(seq_delta_valid.unsqueeze(-1), seq_delta, torch.zeros_like(seq_delta))
+        seq_delta_xy = torch.where(seq_delta_valid.unsqueeze(-1), seq_delta_xy, torch.zeros_like(seq_delta_xy))
+
+        seq_delta = torch.cat([
+            seq_delta_xy,
+            seq_delta_valid.unsqueeze(-1).float()
+        ], dim=-1)
 
         preds6 = []
         seq_frames = obs_frames.clone()
@@ -316,17 +365,24 @@ def evaluate_one_epoch(
 
             last5_raw = seq_raw[:, -1]
             last_valid5 = seq_valid5[:, -1]
-            last6 = model.encoder.add_virtual_root(
-                last5_raw.unsqueeze(1), last_valid5.unsqueeze(1)
-            )[:, 0]
+            last5_clean = torch.nan_to_num(last5_raw, nan=0.0)
+            last_feat = torch.cat([
+                last5_clean.unsqueeze(1),
+                last_valid5.unsqueeze(1).unsqueeze(-1).float()
+            ], dim=-1)                                  # (B,1,M,5,3)
+
+            last6 = model.encoder.add_virtual_root(last_feat)[:, 0, ..., :2]
 
             next6 = last6 + dpos6
             next5 = next6[:, :, :5, :]
             next_valid5 = torch.ones((B, M, 5), device=device, dtype=torch.bool)
 
-            next6 = model.encoder.add_virtual_root(
-                next5.unsqueeze(1), next_valid5.unsqueeze(1)
-            )[:, 0]
+            next_feat = torch.cat([
+                next5.unsqueeze(1),
+                next_valid5.unsqueeze(1).unsqueeze(-1).float()
+            ], dim=-1)                                  # (B,1,M,5,3)
+
+            next6 = model.encoder.add_virtual_root(next_feat)[:, 0, ..., :2]
 
             preds6.append(next6)
 
@@ -334,9 +390,14 @@ def evaluate_one_epoch(
             seq_valid5 = torch.cat([seq_valid5[:, 1:], next_valid5.unsqueeze(1)], dim=1)
             seq_clean = torch.nan_to_num(seq_raw, nan=0.0)
 
-            seq_delta = seq_clean[:, 1:] - seq_clean[:, :-1]
+            seq_delta_xy = seq_clean[:, 1:] - seq_clean[:, :-1]
             seq_delta_valid = seq_valid5[:, 1:] & seq_valid5[:, :-1]
-            seq_delta = torch.where(seq_delta_valid.unsqueeze(-1), seq_delta, torch.zeros_like(seq_delta))
+            seq_delta_xy = torch.where(seq_delta_valid.unsqueeze(-1), seq_delta_xy, torch.zeros_like(seq_delta_xy))
+
+            seq_delta = torch.cat([
+                seq_delta_xy,
+                seq_delta_valid.unsqueeze(-1).float()
+            ], dim=-1)
             last_frame = seq_frames[:, -1:].clone()
             seq_frames = torch.cat([seq_frames[:, 1:], last_frame], dim=1)
 

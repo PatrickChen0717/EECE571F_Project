@@ -49,7 +49,7 @@ random.seed(42)
 n_keep = int(0.05 * len(yaml_paths))
 yaml_paths = random.sample(yaml_paths, n_keep)
 
-ds = KeypointDataset(yaml_paths=yaml_paths, normalize=False)
+ds = KeypointDataset(yaml_paths=yaml_paths, normalize=False, smoothing=True, smoothing_window=5)
 test_dl = DataLoader(ds, batch_size=batch_size, shuffle=False)
 
 
@@ -100,36 +100,64 @@ def add_virtual_root_with_model(model, x5, valid5=None):
       (M,5,2)
       (T,M,5,2)
       (B,T,M,5,2)
-    valid5 matches the leading dims:
-      (M,5) or (T,M,5) or (B,T,M,5)
+
+    valid5 matches leading dims:
+      (M,5), (T,M,5), or (B,T,M,5)
+
     Returns:
       (M,6,2) or (T,M,6,2) or (B,T,M,6,2)
     """
     if x5.dim() == 3:
-        x5_bt = x5.unsqueeze(0).unsqueeze(0)
+        x5_bt = x5.unsqueeze(0).unsqueeze(0)  # (1,1,M,5,2)
         if valid5 is None:
             valid5_bt = torch.isfinite(x5_bt).all(dim=-1)
         else:
             valid5_bt = valid5.unsqueeze(0).unsqueeze(0)
-        x6_bt = model.encoder.add_virtual_root(x5_bt, valid5_bt)
+        x5_clean = torch.nan_to_num(x5_bt, nan=0.0)
+        feat_bt = torch.cat([x5_clean, valid5_bt.unsqueeze(-1).float()], dim=-1)  # (1,1,M,5,3)
+        x6_bt = model.encoder.add_virtual_root(feat_bt)[..., :2]  # (1,1,M,6,2)
         return x6_bt[0, 0]
 
     elif x5.dim() == 4:
-        x5_bt = x5.unsqueeze(0)
+        x5_bt = x5.unsqueeze(0)  # (1,T,M,5,2)
         if valid5 is None:
             valid5_bt = torch.isfinite(x5_bt).all(dim=-1)
         else:
             valid5_bt = valid5.unsqueeze(0)
-        x6_bt = model.encoder.add_virtual_root(x5_bt, valid5_bt)
+        x5_clean = torch.nan_to_num(x5_bt, nan=0.0)
+        feat_bt = torch.cat([x5_clean, valid5_bt.unsqueeze(-1).float()], dim=-1)  # (1,T,M,5,3)
+        x6_bt = model.encoder.add_virtual_root(feat_bt)[..., :2]  # (1,T,M,6,2)
         return x6_bt[0]
 
     elif x5.dim() == 5:
         if valid5 is None:
             valid5 = torch.isfinite(x5).all(dim=-1)
-        return model.encoder.add_virtual_root(x5, valid5)
+        x5_clean = torch.nan_to_num(x5, nan=0.0)
+        feat = torch.cat([x5_clean, valid5.unsqueeze(-1).float()], dim=-1)  # (B,T,M,5,3)
+        return model.encoder.add_virtual_root(feat)[..., :2]
 
     else:
         raise ValueError(f"Unexpected x5 dim: {x5.dim()}")
+
+
+def build_delta_with_vis(seq_raw):
+    """
+    seq_raw: (T,M,5,2) or (B,T,M,5,2), may contain NaN
+
+    returns:
+      delta_in: (...,T-1,M,5,3) = [dx, dy, valid]
+      seq_clean
+      valid5
+    """
+    valid5 = torch.isfinite(seq_raw).all(dim=-1)
+    seq_clean = torch.nan_to_num(seq_raw, nan=0.0)
+
+    delta_xy = seq_clean[1:] - seq_clean[:-1] if seq_raw.dim() == 4 else seq_clean[:, 1:] - seq_clean[:, :-1]
+    valid_delta = valid5[1:] & valid5[:-1] if seq_raw.dim() == 4 else valid5[:, 1:] & valid5[:, :-1]
+
+    delta_xy = torch.where(valid_delta.unsqueeze(-1), delta_xy, torch.zeros_like(delta_xy))
+    delta_in = torch.cat([delta_xy, valid_delta.unsqueeze(-1).float()], dim=-1)
+    return delta_in, seq_clean, valid5
 
 
 @torch.no_grad()
@@ -160,8 +188,8 @@ def predict_episode_blockwise_no_overlap(model, x_full, episode_path, O=30, P=10
     stride = O + P
 
     while t + O <= L:
-        obs5_raw = x_full[t:t+O].clone()
-        obs6 = gt5_to_6(obs5_raw)
+        obs5_raw = x_full[t:t+O].clone()   # (O,M,5,2)
+        obs6 = gt5_to_6(obs5_raw)          # (O,M,6,2)
         pred6[t:t+O] = obs6.cpu()
 
         if t + O >= L:
@@ -170,25 +198,17 @@ def predict_episode_blockwise_no_overlap(model, x_full, episode_path, O=30, P=10
         frame_idx = t + O - 1
         frame = load_frame_tensor(episode_path, frame_idx, device=device)   # (1,3,224,224)
 
-        seq_clean = torch.nan_to_num(obs5_raw, nan=0.0)
-        seq_valid5 = torch.isfinite(obs5_raw).all(dim=-1)
+        seq_raw = obs5_raw.clone()  # keep raw with NaN
+        _, seq_clean, seq_valid5 = build_delta_with_vis(seq_raw)
         last6 = obs6[-1].cpu()
 
         maxP = min(P, L - (t + O))
         for k in range(maxP):
-            win_delta = seq_clean[1:] - seq_clean[:-1]
-            win_delta_valid = seq_valid5[1:] & seq_valid5[:-1]
-            win_delta = torch.where(
-                win_delta_valid.unsqueeze(-1),
-                win_delta,
-                torch.zeros_like(win_delta)
-            )
+            win_delta, seq_clean, seq_valid5 = build_delta_with_vis(seq_raw)   # (O-1,M,5,3)
+            win_in = win_delta.unsqueeze(0).to(device)                         # (1,O-1,M,5,3)
 
-            win_in = win_delta.unsqueeze(0).to(device)  # (1,O-1,M,5,2)
-
-            # new model expects frame sequence: (B,T,3,224,224)
             T = win_in.shape[1]
-            frame_seq = frame.unsqueeze(1).repeat(1, T, 1, 1, 1)  # (1,T,3,224,224)
+            frame_seq = frame.unsqueeze(1).repeat(1, T, 1, 1, 1)              # (1,T,3,224,224)
 
             out = model(win_in, frame_seq)
             mu = _mu_from_model_out(out)
@@ -204,8 +224,7 @@ def predict_episode_blockwise_no_overlap(model, x_full, episode_path, O=30, P=10
             pred6[t + O + k] = next6
             last6 = next6
 
-            seq_clean = torch.cat([seq_clean[1:], next5.unsqueeze(0)], dim=0)
-            seq_valid5 = torch.cat([seq_valid5[1:], next_valid5.unsqueeze(0)], dim=0)
+            seq_raw = torch.cat([seq_raw[1:], next5.unsqueeze(0)], dim=0)
 
         t += stride
 
@@ -256,6 +275,9 @@ def plot_full_episode(model, sample, device, instr_id=0, kp_id=0, O=10):
     stride = O + P
     L_pred = pred_traj.shape[0]
 
+    shown_obs = False
+    shown_pred = False
+
     for t in range(0, L_pred, stride):
         obs_start = t
         obs_end = min(t + O, L_pred)
@@ -267,27 +289,31 @@ def plot_full_episode(model, sample, device, instr_id=0, kp_id=0, O=10):
             plt.plot(
                 obs_block[obs_mask][:, 0],
                 obs_block[obs_mask][:, 1],
-                color="blue"
+                color="blue",
+                label="Observed (O)" if not shown_obs else None
             )
+            shown_obs = True
 
         pred_start = obs_end
         pred_end = min(pred_start + P, L_pred)
 
         fut_block = pred_traj[pred_start:pred_end]
-        fut_mask = mask[pred_start:pred_end]
+        fut_mask = torch.isfinite(fut_block).all(dim=-1)
 
         if fut_mask.any():
             plt.plot(
                 fut_block[fut_mask][:, 0],
                 fut_block[fut_mask][:, 1],
-                color="red"
+                color="red",
+                label="Predicted (P)" if not shown_pred else None
             )
+            shown_pred = True
 
     plt.gca().invert_yaxis()
     plt.title(f"Instr {instr_id}, KP {kp_id} (O={O}, P={P})")
     plt.xlabel("x")
     plt.ylabel("y")
-    plt.legend(["GT Full", "Observed (O)", "Predicted (P)"])
+    plt.legend()
     plt.tight_layout()
     plt.show()
 

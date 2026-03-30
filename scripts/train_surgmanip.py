@@ -284,7 +284,6 @@ def train_one_epoch(
     return total / max(n, 1)
 
 @torch.no_grad()
-@torch.no_grad()
 def evaluate_one_epoch(
     model, dataloader, device, O, P,
     w_pos=1.0, w_delta=0.5
