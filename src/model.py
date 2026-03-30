@@ -72,40 +72,37 @@ class FullModelWithDINOv2(nn.Module):
             nn.Linear(fuse_dim, 2)
         )
 
-    def forward(self, delta, frames=None, disable_visual=False):
+    def forward(self, delta, vis_feats):
         """
-        delta:  (B,T,M,5,2)
-        frames: (B,T,3,224,224)
+        delta:     (B,T,M,5,3)
+        vis_feats: (B,T,V)   precomputed DINO features
+
+        returns:
+        out: (B,T,N,2)
         """
-        _, rhat = self.encoder(delta)   # (B,T,N,Dgat)
-        B, T, N, D = rhat.shape
+        B, T, M, K, C = delta.shape
 
-        if disable_visual:
-            img_feat = torch.zeros(B, T, self.vision_dim, device=rhat.device, dtype=rhat.dtype)
-        else:
-            if frames is None:
-                raise ValueError("frames must be provided when disable_visual=False")
-            img_feat = self.vision_encoder(frames)   # (B,T,vision_dim)
-            img_feat = img_feat.to(device=rhat.device, dtype=rhat.dtype)
-
-        feats = [img_feat]
+        _, rhat = self.encoder(delta)                 # (B,T,N,Dg)
+        B, T, N, Dg = rhat.shape
+        #BATCH NORM
+        vis = vis_feats                               # (B,T,V)
 
         if self.use_visual_diff:
-            diff = torch.zeros_like(img_feat)
-            diff[:, 1:] = img_feat[:, 1:] - img_feat[:, :-1]
-            feats.append(diff)
+            vis_prev = torch.cat([vis[:, :1], vis[:, :-1]], dim=1)
+            vis_diff = vis - vis_prev
+            vis = torch.cat([vis, vis_diff], dim=-1)  # (B,T,2V)
 
-        vis = torch.cat(feats, dim=-1)               # (B,T,Dv)
-        vis = vis[:, :, None, :].expand(B, T, N, vis.shape[-1])
+        vis = vis.unsqueeze(2).expand(-1, -1, N, -1)  # (B,T,N,V or 2V)
 
-        fused = torch.cat([rhat, vis], dim=-1)        # (B,T,N,Dgat+vision_dim)
+        fused = torch.cat([rhat, vis], dim=-1)        # (B,T,N,Dg+vis_dim)
         fused = self.fuse_in(fused)                   # (B,T,N,fuse_dim)
+        # TRANS
+        fused = fused.permute(0, 2, 1, 3).contiguous()   # (B,N,T,F)
+        fused = fused.view(B * N, T, -1)                 # (B*N,T,F)
 
-        B, T, N, F = fused.shape
-        fused = fused.permute(0, 2, 1, 3).contiguous().view(B * N, T, F)
+        fused, _ = self.post_gru(fused)                  # (B*N,T,F)
 
-        fused_out, _ = self.post_gru(fused)
-        out = self.head(fused_out)
+        out = self.head(fused)                           # (B*N,T,2)
+        out = out.view(B, N, T, 2).permute(0, 2, 1, 3).contiguous()  # (B,T,N,2)
 
-        out = out.view(B, N, T, 2).permute(0, 2, 1, 3).contiguous()
         return out

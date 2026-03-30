@@ -13,7 +13,7 @@ class LSTM_gat(nn.Module):
 
         # Φ embedding
         self.phi = nn.Sequential(
-            nn.Linear(2, embed_dim),
+            nn.Linear(3, embed_dim),
             nn.ReLU(),
             nn.Linear(embed_dim, embed_dim)
         )
@@ -30,17 +30,29 @@ class LSTM_gat(nn.Module):
         self.gat = GAT(in_dim=hidden_size, out_dim=self.gat_out_dim, dropout=0.0, sigma="elu")
 
     @staticmethod
-    def add_virtual_root(pos, valid_xy=None):  # pos: (B,T,M,K,2), K=5
-        if valid_xy is None:
-            # valid if finite
-            valid_xy = torch.isfinite(pos).all(dim=-1)  # (B,T,M,K)
+    def add_virtual_root(feat):
+        """
+        feat: (B,T,M,K,3)
+            last dim = [a, b, vis]
+            where [a,b] can be [dx,dy] or [x,y]
 
-        pos_clean = torch.nan_to_num(pos, nan=0.0)
-        w = valid_xy.unsqueeze(-1).float()              # (B,T,M,K,1)
-        denom = w.sum(dim=3, keepdim=True).clamp_min(1.0)  # (B,T,M,1,1)
-        root = (pos_clean * w).sum(dim=3, keepdim=True) / denom  # (B,T,M,1,2)
+        returns:
+        featR: (B,T,M,K+1,3)
+                root appended LAST
+        """
+        xy = feat[..., :2]                       # (B,T,M,K,2)
+        vis = feat[..., 2] > 0.5                # (B,T,M,K)
 
-        return torch.cat([pos_clean, root], dim=3)      # (B,T,M,6,2) root LAST
+        w = vis.unsqueeze(-1).float()           # (B,T,M,K,1)
+        denom = w.sum(dim=3, keepdim=True).clamp_min(1.0)
+        root_xy = (xy * w).sum(dim=3, keepdim=True) / denom   # (B,T,M,1,2)
+
+        # root visible if any child visible
+        root_vis = vis.any(dim=3, keepdim=True).float().unsqueeze(-1)  # (B,T,M,1,1)
+
+        root_feat = torch.cat([root_xy, root_vis], dim=-1)   # (B,T,M,1,3)
+
+        return torch.cat([feat, root_feat], dim=3)           # (B,T,M,K+1,3)
 
     @staticmethod
     def build_edge_index(num_instruments, K_with_root, device):
@@ -66,33 +78,38 @@ class LSTM_gat(nn.Module):
 
         return torch.tensor(edges, dtype=torch.long, device=device).t().contiguous()  # (2,E)
 
-    def forward(self, delta):
+    def forward(self, feat):
         """
-        delta: (B, T, M, K, 2)
-            precomputed delta positions
+        feat: (B, T, M, K, 3)
+            e.g. [dx, dy, vis] or [x, y, vis]
+
         returns:
         r:    (B, T, N, Dlstm)
         rhat: (B, T, N, Dgat)
         """
-        B, T, M, K, _ = delta.shape
+        B, T, M, K, C = feat.shape
+        assert C == 3, f"Expected last dim = 3, got {C}"
 
-        valid_delta = torch.isfinite(delta).all(dim=-1)   # (B,T,M,K)
-
-        # root is mean delta-motion node
-        deltaR = self.add_virtual_root(delta, valid_delta)   # (B,T,M,KR,2)
-        KR = deltaR.shape[3]
+        # add virtual root per instrument
+        featR = self.add_virtual_root(feat)     # (B,T,M,K+1,3)
+        KR = featR.shape[3]
         N = M * KR
 
-        v = self.phi(deltaR)                                 # (B,T,M,KR,embed)
+        # node embedding
+        v = self.phi(featR)                     # (B,T,M,KR,embed_dim)
         v = v.reshape(B, T, N, self.embed_dim)
 
+        # shared temporal LSTM over each node
         v_lstm = v.permute(1, 0, 2, 3).contiguous().reshape(T, B * N, self.embed_dim)
-        r_lstm, _ = self.lstm_spa(v_lstm)
+        r_lstm, _ = self.lstm_spa(v_lstm)       # (T,B*N,H)
+
         Dl = r_lstm.shape[-1]
-        r = r_lstm.reshape(T, B, N, Dl).permute(1, 0, 2, 3).contiguous()
+        r = r_lstm.reshape(T, B, N, Dl).permute(1, 0, 2, 3).contiguous()  # (B,T,N,H)
 
-        edge_index = self.build_edge_index(M, KR, device=delta.device)
+        # graph edges
+        edge_index = self.build_edge_index(M, KR, device=feat.device)
 
+        # GAT at each time step
         rhat_list = []
         for t in range(T):
             rhat_t = self.gat(r[:, t], edge_index)   # (B,N,Dgat)
