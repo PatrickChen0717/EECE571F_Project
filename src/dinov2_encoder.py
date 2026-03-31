@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from transformers import AutoImageProcessor, AutoModel
+from transformers import AutoModel
 
 class DINOv2Encoder(nn.Module):
     def __init__(self, model_name="facebook/dinov2-small", out_dim=256, freeze=True, use_cls=False):

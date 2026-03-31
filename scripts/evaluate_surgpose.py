@@ -6,15 +6,18 @@ import glob, random
 from src.LSTM import LSTM_gat
 from src.model import FullModelWithResNet
 from src.model import FullModelWithDINOv2
-from data.dataloader import KeypointDataset
+from data.dataloader import KeypointDataset, WindowedKeypointDataset
 from PIL import Image
 from torchvision import transforms
 import os
 
 device = "cpu"
+# conda activate py310
 
 # ----- build + load model -----
-encoder = LSTM_gat(hidden_size=128, embed_dim=64)
+encoder_hidden_size = 256
+encoder_embed_dim = 128
+encoder = LSTM_gat(hidden_size=encoder_hidden_size, embed_dim=encoder_embed_dim)
 # model = FullModelWithResNet(encoder, vision_dim=128).to(device)
 model = FullModelWithDINOv2(encoder, vision_dim=128).to(device)
 
@@ -27,12 +30,12 @@ img_transform = transforms.Compose([
     )
 ])
 
-ckpt = "models/model_weights_2026-03-18_01-18-07/epoch98.pth"
+ckpt = "models/model_weights_2026-03-31_12-31-53/epoch31.pth"
 model.load_state_dict(torch.load(ckpt, map_location=device))
 model.eval()
 
-O = 30
-P = 15
+O = 50
+P = 10
 batch_size = 64
 
 lp = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -40,16 +43,29 @@ print("Learnable parameters:", lp)
 
 # ----- dataset -----
 paths_left = glob.glob(
-    r"E:\EECE571F\SurgPose_dataset\**\keypoints_left.yaml",
+    "/raid/home/patrickbyc/SurgPose_dataset_no_vid/**/keypoints_left.yaml",
     recursive=True
 )
 yaml_paths = paths_left
 
+print("num yamls found:", len(yaml_paths))
+
 random.seed(42)
-n_keep = int(0.05 * len(yaml_paths))
+n_keep = max(1, int(0.5 * len(yaml_paths)))   # prevent 0
 yaml_paths = random.sample(yaml_paths, n_keep)
 
-ds = KeypointDataset(yaml_paths=yaml_paths, normalize=False, smoothing=True, smoothing_window=5)
+print("num yamls kept:", len(yaml_paths))
+
+ds = KeypointDataset(
+    yaml_paths=yaml_paths,
+    normalize=False,
+    smoothing=True,
+    smoothing_window=19,
+    load_features=True
+)
+# dataset  = WindowedKeypointDataset(ds,  O=O, P=P, random_window=False, load_from_image=False)
+print("dataset size:", len(ds))
+
 test_dl = DataLoader(ds, batch_size=batch_size, shuffle=False)
 
 
@@ -80,6 +96,24 @@ def load_frame_tensor(episode_path, frame_idx, device="cpu"):
     img = Image.open(frame_path).convert("RGB")
     frame = img_transform(img).unsqueeze(0).to(device)   # (1,3,224,224)
     return frame
+
+def load_feature_tensor(episode_path, frame_idx, device="cpu"):
+    if isinstance(episode_path, list):
+        episode_path = episode_path[0]
+
+    episode_dir = os.path.dirname(episode_path)
+
+    feat_path = os.path.join(
+        episode_dir,
+        "regular/left_frame_pt",
+        f"{frame_idx:06d}.pt"
+    )
+
+    if not os.path.exists(feat_path):
+        raise FileNotFoundError(f"Feature not found: {feat_path}")
+
+    feat = torch.load(feat_path, map_location=device)   # (D,)
+    return feat.unsqueeze(0)   # (1,D)
 
 
 def _mu_from_model_out(out):
@@ -167,63 +201,78 @@ def predict_episode_blockwise_no_overlap(model, x_full, episode_path, O=30, P=10
       block k uses GT obs [t:t+O) -> predicts [t+O:t+O+P)
       then t += O+P
 
-    x_full: (L,M,5,2) absolute positions (NaNs allowed)
-    returns pred6: (L,M,6,2) with NaNs where not filled
+    x_full: (L,M,5,2) or (L,5,2), may contain NaN
+    returns:
+      pred6: (L,M,6,2) with NaNs where not filled
     """
     model.eval()
 
+    x_full = torch.as_tensor(x_full, dtype=torch.float32)
     x_full = x_full[..., :2]
+
     if x_full.dim() == 3:
         x_full = x_full.unsqueeze(1)  # (L,1,5,2)
 
-    L, M, _, _ = x_full.shape
-    pred6 = torch.full((L, M, 6, 2), float("nan"))
+    L, M, K, C = x_full.shape
+    if K != 5 or C != 2:
+        raise ValueError(f"Expected x_full shape (L,M,5,2), got {tuple(x_full.shape)}")
+
+    pred6 = torch.full((L, M, 6, 2), float("nan"), dtype=torch.float32)
 
     def gt5_to_6(x5):
         valid5 = torch.isfinite(x5).all(dim=-1)
-        x6 = add_virtual_root_with_model(model, x5, valid5)
-        return x6
+        return add_virtual_root_with_model(model, x5, valid5)
 
     t = 0
     stride = O + P
 
     while t + O <= L:
-        obs5_raw = x_full[t:t+O].clone()   # (O,M,5,2)
-        obs6 = gt5_to_6(obs5_raw)          # (O,M,6,2)
-        pred6[t:t+O] = obs6.cpu()
+        obs5_raw = x_full[t:t + O].clone()   # (O,M,5,2)
+        obs6 = gt5_to_6(obs5_raw)            # (O,M,6,2)
+        pred6[t:t + O] = obs6.cpu()
 
         if t + O >= L:
             break
 
         frame_idx = t + O - 1
-        frame = load_frame_tensor(episode_path, frame_idx, device=device)   # (1,3,224,224)
 
-        seq_raw = obs5_raw.clone()  # keep raw with NaN
-        _, seq_clean, seq_valid5 = build_delta_with_vis(seq_raw)
-        last6 = obs6[-1].cpu()
+        # Load one feature for the conditioning frame of this block
+        feat = load_feature_tensor(episode_path, frame_idx, device=device)  # (1,D)
+
+        seq_raw = obs5_raw.clone()    # (O,M,5,2), may contain NaN
+        last6 = obs6[-1].cpu()        # (M,6,2)
 
         maxP = min(P, L - (t + O))
         for k in range(maxP):
-            win_delta, seq_clean, seq_valid5 = build_delta_with_vis(seq_raw)   # (O-1,M,5,3)
-            win_in = win_delta.unsqueeze(0).to(device)                         # (1,O-1,M,5,3)
+            win_delta, _, _ = build_delta_with_vis(seq_raw)   # (O-1,M,5,3)
+            win_in = win_delta.unsqueeze(0).to(device)        # (1,O-1,M,5,3)
 
             T = win_in.shape[1]
-            frame_seq = frame.unsqueeze(1).repeat(1, T, 1, 1, 1)              # (1,T,3,224,224)
+            feat_seq = feat.unsqueeze(1).repeat(1, T, 1)      # (1,T,D)
 
-            out = model(win_in, frame_seq)
-            mu = _mu_from_model_out(out)
-            dposN = mu[0, -1].detach().cpu()
+            out = model(win_in, feat_seq)
+            mu = _mu_from_model_out(out)                      # (1,T,N,2) usually
+            dposN = mu[0, -1].detach().cpu()                  # (N,2)
+
+            if dposN.numel() != M * 6 * 2:
+                raise RuntimeError(
+                    f"Model output size mismatch: got {tuple(dposN.shape)}, "
+                    f"cannot reshape to ({M}, 6, 2)"
+                )
+
             dpos6 = dposN.view(M, 6, 2)
 
-            next6 = last6 + dpos6
-            next5 = next6[:, :5, :]
-            next_valid5 = torch.ones((M, 5), dtype=torch.bool)
+            next6 = last6 + dpos6           # (M,6,2)
+            next5 = next6[:, :5, :]         # (M,5,2)
+            next_valid5 = torch.isfinite(next5).all(dim=-1)
 
+            # recompute virtual root consistently
             next6 = add_virtual_root_with_model(model, next5, next_valid5).cpu()
 
             pred6[t + O + k] = next6
             last6 = next6
 
+            # autoregressive update of obs window
             seq_raw = torch.cat([seq_raw[1:], next5.unsqueeze(0)], dim=0)
 
         t += stride
@@ -315,15 +364,22 @@ def plot_full_episode(model, sample, device, instr_id=0, kp_id=0, O=10):
     plt.ylabel("y")
     plt.legend()
     plt.tight_layout()
-    plt.show()
+    
+    save_dir = "/raid/home/patrickbyc/EECE571F_Project/outputs/plots"
+    os.makedirs(save_dir, exist_ok=True)
+
+    save_path = os.path.join(save_dir, f"traj_instr{instr_id}_kp{kp_id}.png")
+    print(save_path)
+    plt.savefig(save_path, dpi=200)
+    plt.close()
 
 
 # ---- run one sample ----
 batch = next(iter(test_dl))
-i = 0
+i = 4
 
 sample = {}
 for k, v in batch.items():
     sample[k] = v[i]
 
-plot_full_episode(model, sample, device=device, instr_id=1, kp_id=4, O=O)
+plot_full_episode(model, sample, device=device, instr_id=1, kp_id=1, O=O)

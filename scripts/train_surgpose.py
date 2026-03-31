@@ -12,6 +12,7 @@ from src.model import FullModelWithResNet
 from src.model import FullModelWithDINOv2
 from data.dataloader import KeypointDataset, WindowedKeypointDataset
 
+from pathlib import Path
 import glob
 import numpy as np
 from tqdm import tqdm
@@ -22,16 +23,23 @@ wandb.login(key="8b49b325ce8e9e788b2981b63eebbc01ee33bc6b")
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
 # ----- fake dataset example -----
-SAVE_INTERVAL = 3
+SAVE_INTERVAL = 1
 NUM_EPOCHS = 150
 BATCH = 64
-O = 30
-P = 15
+O = 50
+P = 10
+STRIDE = 10
+Normalize = False
+Smoothing = False
+Smoothing_window = 5
 M = 2               # Number of instruments
-lr = 1e-3
+lr = 1e-4
 Enable_WandB = True
+encode_hidden_size = 256
+encoder_embed_dim = 128
 
-paths_left = glob.glob(r"C:\Users\Patrick\Documents\eece571F\SurgPose_dataset\**\keypoints_left.yaml", recursive=True)
+base = Path("/raid/home/patrickbyc/SurgPose_dataset_no_vid")
+paths_left = list(base.rglob("keypoints_left.yaml"))
 # paths_right = glob.glob(r"C:\Users\Patrick\Documents\eece571F\SurgPose_dataset\**\keypoints_right.yaml", recursive=True)
 
 yaml_paths = paths_left
@@ -43,9 +51,9 @@ if len(yaml_paths) == 0:
 
 ds = KeypointDataset(
     yaml_paths=yaml_paths,
-    normalize=False,
-    smoothing=True,
-    smoothing_window=5
+    normalize=Normalize,
+    smoothing=Smoothing_window,
+    smoothing_window=5,
 )
 
 # 80 / 20 split
@@ -59,8 +67,8 @@ train_base, test_base = random_split(
     generator=torch.Generator().manual_seed(42)
 )
 
-train_set = WindowedKeypointDataset(train_base, O=O, P=P, random_window=False, load_from_image=False)
-test_set  = WindowedKeypointDataset(test_base,  O=O, P=P, random_window=False, load_from_image=False)
+train_set = WindowedKeypointDataset(train_base, O=O, P=P, random_window=False, load_from_image=False, stride=STRIDE)
+test_set  = WindowedKeypointDataset(test_base,  O=O, P=P, random_window=False, load_from_image=False, stride=STRIDE)
 print("num train_set:", len(train_set))
 print("num test_set:", len(test_set))
 train_dl = DataLoader(train_set, batch_size=BATCH, shuffle=True)
@@ -77,6 +85,12 @@ if Enable_WandB:
         "batch_size": BATCH,
         "Obs_frames": O,
         "Pred_frames": P,
+        "stride": STRIDE,
+        "normalize": Normalize,
+        "smoothing": Smoothing,
+        "smoothing_window": Smoothing_window,
+        "encode_hidden_size": encode_hidden_size,
+        "encoder_embed_dim": encoder_embed_dim,
         "num_keypoint_yaml": len(yaml_paths),
     }
     wandb.init(
@@ -88,7 +102,7 @@ if Enable_WandB:
 
 
 # ----- build model -----
-encoder = LSTM_gat(hidden_size=128, embed_dim=64)
+encoder = LSTM_gat(hidden_size=encode_hidden_size, embed_dim=encoder_embed_dim)
 # model = FullModelWithResNet(encoder, vision_dim=128).to(device)
 model = FullModelWithDINOv2(encoder, vision_dim=128).to(device)
 

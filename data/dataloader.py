@@ -60,13 +60,14 @@ def temporal_moving_average(x, window_size=5):
 
 
 class KeypointDataset(Dataset):
-    def __init__(self, yaml_paths, normalize=False, smoothing=False, smoothing_window=5):
+    def __init__(self, yaml_paths, normalize=False, smoothing=False, smoothing_window=5, load_features=False, mean=None, std=None):
         self.yaml_paths = list(yaml_paths)
         self.groups = [[1, 2, 3, 4, 5], [8, 9, 10, 11, 12]]
         self.normalize = normalize
         self.smoothing = smoothing
         self.smoothing_window = smoothing_window
-
+        self.load_features = load_features
+        
         self.samples = []
         all_xy = []
 
@@ -77,17 +78,30 @@ class KeypointDataset(Dataset):
                 x = temporal_moving_average(x, self.smoothing_window)
 
             x = x.astype(np.float32)
-            self.samples.append({
+            sample = {
                 "x": torch.from_numpy(x).float(),
                 "length": int(x.shape[0]),
-                "episode_path": path,
-            })
+                "episode_path": str(path),
+            }
+
+            if load_features:
+                feats = self._load_all_features_for_episode(path)
+
+                # optional safety check
+                if feats.shape[0] != x.shape[0]:
+                    raise RuntimeError(
+                        f"Feature length {feats.shape[0]} != keypoints {x.shape[0]} for {path}"
+                    )
+
+                sample["features"] = feats
+
+            self.samples.append(sample)
 
             if self.normalize:
                 all_xy.append(x.reshape(-1, 2))
 
-        self.mean = None
-        self.std = None
+        self.mean = mean
+        self.std = std
         if self.normalize:
             all_xy = np.concatenate(all_xy, axis=0)
             self.mean = np.nanmean(all_xy, axis=0).astype(np.float32)
@@ -97,6 +111,26 @@ class KeypointDataset(Dataset):
             std_t = torch.from_numpy(self.std).float()
             for s in self.samples:
                 s["x"] = (s["x"] - mean_t) / std_t
+
+    def _load_all_features_for_episode(self, episode_path):
+        parts = str(episode_path).split(os.sep)
+        feat_dir = os.sep.join(parts[:-1] + ["regular", "left_frame_pt"])
+
+        if not os.path.exists(feat_dir):
+            raise FileNotFoundError(feat_dir)
+
+        feat_files = sorted(
+            [f for f in os.listdir(feat_dir) if f.endswith(".pt")],
+            key=lambda f: int(os.path.splitext(f)[0])
+        )
+
+        feats = []
+        for fn in feat_files:
+            feat_path = os.path.join(feat_dir, fn)
+            feat = torch.load(feat_path, map_location="cpu").float()
+            feats.append(feat)
+
+        return torch.stack(feats, dim=0)  # (T, D)
 
     def __len__(self):
         return len(self.samples)
@@ -148,14 +182,14 @@ class WindowedKeypointDataset(Dataset):
         return len(self.window_index)
 
     def _get_video_path(self, episode_path):
-        parts = episode_path.split(os.sep)
+        parts = str(episode_path).split(os.sep)
         video_path = os.sep.join(parts[:-1] + ["regular", "left_video.mp4"])
         if not os.path.exists(video_path):
             raise FileNotFoundError(video_path)
         return video_path
 
     def _get_feature_dir(self, episode_path):
-        parts = episode_path.split(os.sep)
+        parts = str(episode_path).split(os.sep)
         feat_dir = os.sep.join(parts[:-1] + ["regular", "left_frame_pt"])
         if not os.path.exists(feat_dir):
             raise FileNotFoundError(feat_dir)
@@ -206,6 +240,7 @@ class WindowedKeypointDataset(Dataset):
 
         if self.cache_features:
             self._feature_cache[episode_path] = feat_tensor
+        
         return feat_tensor
 
     def __getitem__(self, idx):
@@ -249,7 +284,7 @@ class WindowedKeypointDataset(Dataset):
                 "obs_frames": obs_frames.float(),
                 "full_frames": full_frames.float(),
                 "frame": last_obs_frame.float(),
-                "episode_path": episode_path,
+                "episode_path": str(episode_path),
                 "start_idx": start,
             }
         else:
@@ -265,6 +300,6 @@ class WindowedKeypointDataset(Dataset):
                 "obs_frames": obs_feats.float(),
                 "full_frames": full_feats.float(),
                 "frame": last_obs_feat.float(),
-                "episode_path": episode_path,
+                "episode_path": str(episode_path),
                 "start_idx": start,
             }
