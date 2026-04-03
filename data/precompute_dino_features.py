@@ -9,7 +9,7 @@ from src.dinov2_encoder import DINOv2Encoder
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
-root = r"C:\Users\Patrick\Documents\eece571F\SurgPose_dataset"
+root = os.getenv("SURGPOSE_DIR")
 
 paths_left = glob.glob(os.path.join(root, "**", "regular", "left_frames"), recursive=True)
 print("found left_frames dirs:", len(paths_left))

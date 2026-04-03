@@ -10,3 +10,5 @@ models/*
 
 # WandB
 wandb/
+test/
+.env

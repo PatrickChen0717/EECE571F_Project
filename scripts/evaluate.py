@@ -22,16 +22,22 @@ O = 30
 P = 30
 
 # ----- dataset -----
-paths_left  = glob.glob(r"C:\Users\Patrick\Documents\eece571F\SurgPose_dataset\**\keypoints_left.yaml",  recursive=True)
-paths_right = glob.glob(r"C:\Users\Patrick\Documents\eece571F\SurgPose_dataset\**\keypoints_right.yaml", recursive=True)
+paths_left = glob.glob(
+    os.path.join(os.getenv("SURGPOSE_DIR"), "**", "keypoints_left.yaml"), recursive=True
+)
+paths_right = glob.glob(
+    os.path.join(os.getenv("SURGPOSE_DIR"), "**", "keypoints_right.yaml"),
+    recursive=True,
+)
 yaml_paths = paths_left + paths_right
 
 random.seed(42)
-n_keep = int(0.05*len(yaml_paths))
+n_keep = int(0.05 * len(yaml_paths))
 yaml_paths = random.sample(yaml_paths, n_keep)
 
 ds = KeypointDataset(yaml_paths=yaml_paths, normalize=False)
 test_dl = DataLoader(ds, batch_size=32, shuffle=False)
+
 
 def _mu_from_model_out(out):
     # out: (B,T,N,2/4) or (B,T,1,N,2/4)
@@ -43,6 +49,7 @@ def _mu_from_model_out(out):
     if C == 4:
         return out[..., 0:2]
     raise RuntimeError(f"Unexpected output last dim C={C}")
+
 
 def add_virtual_root_with_model(model, x5, valid5=None):
     """
@@ -62,17 +69,17 @@ def add_virtual_root_with_model(model, x5, valid5=None):
             valid5_bt = torch.isfinite(x5_bt).all(dim=-1)  # (1,1,M,5)
         else:
             valid5_bt = valid5.unsqueeze(0).unsqueeze(0)
-        x6_bt = model.encoder.add_virtual_root(x5_bt, valid5_bt)   # (1,1,M,6,2)
+        x6_bt = model.encoder.add_virtual_root(x5_bt, valid5_bt)  # (1,1,M,6,2)
         return x6_bt[0, 0]
 
     elif x5.dim() == 4:
         # (T,M,5,2) -> (1,T,M,5,2)
         x5_bt = x5.unsqueeze(0)
         if valid5 is None:
-            valid5_bt = torch.isfinite(x5_bt).all(dim=-1)          # (1,T,M,5)
+            valid5_bt = torch.isfinite(x5_bt).all(dim=-1)  # (1,T,M,5)
         else:
             valid5_bt = valid5.unsqueeze(0)
-        x6_bt = model.encoder.add_virtual_root(x5_bt, valid5_bt)   # (1,T,M,6,2)
+        x6_bt = model.encoder.add_virtual_root(x5_bt, valid5_bt)  # (1,T,M,6,2)
         return x6_bt[0]
 
     elif x5.dim() == 5:
@@ -83,46 +90,50 @@ def add_virtual_root_with_model(model, x5, valid5=None):
 
     else:
         raise ValueError(f"Unexpected x5 dim: {x5.dim()}")
-    
+
+
 @torch.no_grad()
-def predict_full_episode_autoreg(model, x_full, O=10, device="cpu", instr_id=0, kp_id=0):
+def predict_full_episode_autoreg(
+    model, x_full, O=10, device="cpu", instr_id=0, kp_id=0
+):
     """
     x_full: (L,M,5,2) absolute positions (NaNs allowed)
     returns pred6: (L,M,6,2)
     """
     model.eval()
-    x_full = x_full[..., :2]                         # keep xy
+    x_full = x_full[..., :2]  # keep xy
     L, M, K, _ = x_full.shape
     O = min(O, L)
 
     # keep raw + clean + valid
     x_raw = x_full.clone()
     x_clean = torch.nan_to_num(x_raw, nan=0.0)
-    x_valid5 = torch.isfinite(x_raw).all(dim=-1)     # (L,M,5)
+    x_valid5 = torch.isfinite(x_raw).all(dim=-1)  # (L,M,5)
 
     # seed with GT first O frames
-    seq_raw   = x_raw[:O].clone()                    # (O,M,5,2)
+    seq_raw = x_raw[:O].clone()  # (O,M,5,2)
     seq_clean = x_clean[:O].clone()
-    seq_valid = x_valid5[:O].clone()                 # (O,M,5)
+    seq_valid = x_valid5[:O].clone()  # (O,M,5)
 
     out6 = add_virtual_root_with_model(model, seq_raw, seq_valid)  # (O,M,6,2)
     preds6 = [out6[t].cpu() for t in range(O)]
 
     for t in range(O, L):
-        hist_clean = seq_clean[-O:]                   # (O,M,5,2)
-        win_in = hist_clean.unsqueeze(0).to(device)   # (1,O,M,5,2)
+        hist_clean = seq_clean[-O:]  # (O,M,5,2)
+        win_in = hist_clean.unsqueeze(0).to(device)  # (1,O,M,5,2)
 
-        out = model(win_in)                           # (1,O,N,2/4)
-        mu = _mu_from_model_out(out)                  # (1,O,N,2)
-        dposN = mu[0, -1].detach().cpu()              # (N,2)
-        dpos6 = dposN.view(M, 6, 2)                   # (M,6,2)
+        out = model(win_in)  # (1,O,N,2/4)
+        mu = _mu_from_model_out(out)  # (1,O,N,2)
+        dposN = mu[0, -1].detach().cpu()  # (N,2)
+        dpos6 = dposN.view(M, 6, 2)  # (M,6,2)
 
+        last6 = preds6[-1]  # (M,6,2) on CPU
+        next6 = last6 + dpos6  # (M,6,2)
 
-        last6 = preds6[-1]                            # (M,6,2) on CPU
-        next6 = last6 + dpos6                         # (M,6,2)
-
-        next5 = next6[:, :5, :]                       # (M,5,2)
-        next_valid5 = torch.ones((M, 5), dtype=torch.bool)  # predicted kps treated as valid
+        next5 = next6[:, :5, :]  # (M,5,2)
+        next_valid5 = torch.ones(
+            (M, 5), dtype=torch.bool
+        )  # predicted kps treated as valid
         next6 = add_virtual_root_with_model(model, next5, next_valid5).cpu()
 
         preds6.append(next6)
@@ -130,7 +141,8 @@ def predict_full_episode_autoreg(model, x_full, O=10, device="cpu", instr_id=0, 
         # slide windows (raw validity no longer matters after prediction; predicted are valid)
         seq_clean = torch.cat([seq_clean, next5.unsqueeze(0)], dim=0)
 
-    return torch.stack(preds6, dim=0)                 # (L,M,6,2)
+    return torch.stack(preds6, dim=0)  # (L,M,6,2)
+
 
 @torch.no_grad()
 def plot_full_episode(model, sample, device, instr_id=0, kp_id=0, O=10):
@@ -143,7 +155,9 @@ def plot_full_episode(model, sample, device, instr_id=0, kp_id=0, O=10):
     L, M, _, _ = x_full.shape
     valid_xy = torch.isfinite(x_full).all(dim=-1)
 
-    pred6 = predict_full_episode_autoreg(model, x_full, O=O, device=device, instr_id=instr_id, kp_id=kp_id)
+    pred6 = predict_full_episode_autoreg(
+        model, x_full, O=O, device=device, instr_id=instr_id, kp_id=kp_id
+    )
     gt_valid5 = torch.isfinite(x_full).all(dim=-1)
     gt6 = add_virtual_root_with_model(model, x_full, gt_valid5)
 
@@ -165,16 +179,29 @@ def plot_full_episode(model, sample, device, instr_id=0, kp_id=0, O=10):
     plt.figure()
 
     # Ground truth full trajectory
-    plt.plot(gt_traj[mask][:, 0], gt_traj[mask][:, 1],
-             color="black", linestyle="--", label="GT Full")
+    plt.plot(
+        gt_traj[mask][:, 0],
+        gt_traj[mask][:, 1],
+        color="black",
+        linestyle="--",
+        label="GT Full",
+    )
 
     # Observed frames
-    plt.plot(pred_obs[mask_obs][:, 0], pred_obs[mask_obs][:, 1],
-             color="blue", label="Observed (O frames)")
+    plt.plot(
+        pred_obs[mask_obs][:, 0],
+        pred_obs[mask_obs][:, 1],
+        color="blue",
+        label="Observed (O frames)",
+    )
 
     # Predicted future
-    plt.plot(pred_fut[mask_fut][:, 0], pred_fut[mask_fut][:, 1],
-             color="red", label="Predicted Future")
+    plt.plot(
+        pred_fut[mask_fut][:, 0],
+        pred_fut[mask_fut][:, 1],
+        color="red",
+        label="Predicted Future",
+    )
 
     plt.axvline(0)  # optional reference
     plt.gca().invert_yaxis()
@@ -184,6 +211,7 @@ def plot_full_episode(model, sample, device, instr_id=0, kp_id=0, O=10):
     plt.legend()
     plt.tight_layout()
     plt.show()
+
 
 # ---- run one sample ----
 batch = next(iter(test_dl))

@@ -33,9 +33,9 @@ M = 2               # Number of instruments
 lr = 1e-3
 Enable_WandB = True
 
-xml_path = r"C:\Users\Patrick\Downloads\surgmanip_pb_suturing_5hz\left_frames\annotations.xml"
-image_dir = r"C:\Users\Patrick\Downloads\surgmanip_pb_suturing_5hz\left_frames"
-feature_dir = r"C:\Users\Patrick\Downloads\surgmanip_pb_suturing_5hz\dino_features"
+xml_path = os.path.join(os.getenv("SURGMANIP_DIR"), "left_frames", "annotations.xml")
+image_dir = os.path.join(os.getenv("SURGMANIP_DIR"), "left_frames")
+feature_dir = os.path.join(os.getenv("SURGMANIP_DIR"), "dino_features")
 
 img_tf = transforms.Compose([
     transforms.Resize((224, 224)),

@@ -38,9 +38,9 @@ Enable_WandB = True
 encode_hidden_size = 256
 encoder_embed_dim = 128
 
-base = Path("/raid/home/patrickbyc/SurgPose_dataset_no_vid")
+base = Path(os.getenv("SURGPOSE_DIR"))
 paths_left = list(base.rglob("keypoints_left.yaml"))
-# paths_right = glob.glob(r"C:\Users\Patrick\Documents\eece571F\SurgPose_dataset\**\keypoints_right.yaml", recursive=True)
+# paths_right = glob.glob(os.path.join(os.getenv("SURGPOSE_DIR"), "**", "keypoints_right.yaml"), recursive=True)
 
 yaml_paths = paths_left
 
