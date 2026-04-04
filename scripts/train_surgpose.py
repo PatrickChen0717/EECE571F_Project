@@ -25,7 +25,7 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 # ----- fake dataset example -----
 SAVE_INTERVAL = 1
 NUM_EPOCHS = 150
-BATCH = 64
+BATCH = 32
 O = 50
 P = 10
 STRIDE = 10
@@ -35,8 +35,14 @@ Smoothing_window = 5
 M = 2               # Number of instruments
 lr = 1e-4
 Enable_WandB = True
-encode_hidden_size = 256
-encoder_embed_dim = 128
+encode_hidden_size = 128
+encoder_embed_dim = 64
+Transformer_used = False
+
+w_pos = 1.0
+w_delta = 0.3
+w_dir = 0.2
+w_mag = 0.3
 
 base = Path("/raid/home/patrickbyc/SurgPose_dataset_no_vid")
 paths_left = list(base.rglob("keypoints_left.yaml"))
@@ -91,6 +97,11 @@ if Enable_WandB:
         "smoothing_window": Smoothing_window,
         "encode_hidden_size": encode_hidden_size,
         "encoder_embed_dim": encoder_embed_dim,
+        "Transformer_used": Transformer_used,
+        "w_pos": w_pos,
+        "w_delta": w_delta,
+        "w_dir": w_dir,
+        "w_mag": w_mag,
         "num_keypoint_yaml": len(yaml_paths),
     }
     wandb.init(
@@ -186,37 +197,65 @@ def _make_gt_and_mask(model, pos_raw):
 
     return gt_delta, mask, delta_in, pos_clean
 
+@torch.no_grad()
+def _direction_loss(pred_delta, gt_delta, mask=None, eps=1e-8, min_speed=1.0):
+    """
+    pred_delta, gt_delta: (..., 2)
+    mask: (...,) boolean or float
+    """
+    gt_norm = torch.norm(gt_delta, dim=-1)          # (...)
+    pred_norm = torch.norm(pred_delta, dim=-1)      # (...)
+
+    valid = gt_norm > min_speed
+    if mask is not None:
+        if mask.dtype != torch.bool:
+            mask = mask > 0
+        valid = valid & mask
+
+    if not valid.any():
+        return pred_delta.new_tensor(0.0)
+
+    pred_unit = pred_delta / (pred_norm.unsqueeze(-1) + eps)
+    gt_unit   = gt_delta   / (gt_norm.unsqueeze(-1) + eps)
+
+    cos = (pred_unit * gt_unit).sum(dim=-1).clamp(-1.0, 1.0)
+    return (1.0 - cos[valid]).mean()
+
 
 def train_one_epoch(
     model, dataloader, optimizer, device, O, P,
-    w_pos=1.0, w_delta=0.5, grad_clip=1.0
+    w_pos=1.0, w_delta=0.5, w_dir=0.2, w_mag=0.1, grad_clip=1.0
 ):
     model.train()
     total, n = 0.0, 0
 
     pbar = tqdm(dataloader, desc="Train", leave=False)
-    
+
     for batch in pbar:
         obs_raw = batch["obs"].to(device).float()
         fut_raw = batch["fut"].to(device).float()
 
-        obs_frames  = batch["obs_frames"].to(device).float()    # (B,O-1,3,224,224)
-        full_frames = batch["full_frames"].to(device).float()   # (B,O+P-1,3,224,224)
+        obs_frames  = batch["obs_frames"].to(device).float()
+        full_frames = batch["full_frames"].to(device).float()
 
         obs = torch.nan_to_num(obs_raw, nan=0.0)
         fut = torch.nan_to_num(fut_raw, nan=0.0)
 
+        # -------------------------
         # (A) Teacher-forced delta loss
+        # -------------------------
         full_raw = torch.cat([obs_raw, fut_raw], dim=1)
         gt_delta, mask_delta, full_delta_in, full_clean = _make_gt_and_mask(model, full_raw)
 
         out_tf = model(full_delta_in, full_frames)
-        pred_mu_tf = _as_delta_pred(out_tf)
+        pred_mu_tf = _as_delta_pred(out_tf)   # (B,O+P-1,N,2) expected
         pred_delta_tf = pred_mu_tf
 
         delta_loss = ((pred_delta_tf - gt_delta) ** 2 * mask_delta).sum() / mask_delta.sum().clamp_min(1.0)
 
+        # -------------------------
         # (B) Rollout absolute position loss
+        # -------------------------
         fut_valid5 = torch.isfinite(fut_raw).all(dim=-1)
         fut_clean = torch.nan_to_num(fut_raw, nan=0.0)
         fut_feat = torch.cat([
@@ -224,11 +263,11 @@ def train_one_epoch(
             fut_valid5.unsqueeze(-1).float()
         ], dim=-1)   # (B,P,M,5,3)
 
-        gt_fut6 = model.encoder.add_virtual_root(fut_feat)[..., :2]
+        gt_fut6 = model.encoder.add_virtual_root(fut_feat)[..., :2]   # (B,P,M,6,2)
 
         root_valid = fut_valid5.any(dim=-1, keepdim=True)
-        valid6 = torch.cat([fut_valid5, root_valid], dim=-1)
-        mask6 = valid6.unsqueeze(-1).expand(-1, -1, -1, -1, 2).float()
+        valid6 = torch.cat([fut_valid5, root_valid], dim=-1)          # (B,P,M,6)
+        mask6 = valid6.unsqueeze(-1).float()                          # (B,P,M,6,1)
 
         B, _, M, _, _ = obs.shape
 
@@ -245,14 +284,16 @@ def train_one_epoch(
             seq_delta_valid.unsqueeze(-1).float()
         ], dim=-1)   # (B,O-1,M,5,3)
 
-        seq_frames = obs_frames.clone()   # (B,O-1,3,224,224)
+        seq_frames = obs_frames.clone()
 
         preds6 = []
+        pred_rollout_deltas6 = []
+
         for _step in range(P):
             out = model(seq_delta, seq_frames)
             mu = _as_delta_pred(out)
-            dposN = mu[:, -1]
-            dpos6 = dposN.view(B, M, 6, 2)
+            dposN = mu[:, -1]                       # (B,N,2)
+            dpos6 = dposN.view(B, M, 6, 2)         # (B,M,6,2)
 
             last5_raw = seq_raw[:, -1]
             last_valid5 = seq_valid5[:, -1]
@@ -262,7 +303,7 @@ def train_one_epoch(
                 last_valid5.unsqueeze(1).unsqueeze(-1).float()
             ], dim=-1)
 
-            last6 = model.encoder.add_virtual_root(last_feat)[:, 0, ..., :2]
+            last6 = model.encoder.add_virtual_root(last_feat)[:, 0, ..., :2]   # (B,M,6,2)
 
             next6 = last6 + dpos6
             next5 = next6[:, :, :5, :]
@@ -276,6 +317,7 @@ def train_one_epoch(
             next6 = model.encoder.add_virtual_root(next_feat)[:, 0, ..., :2]
 
             preds6.append(next6)
+            pred_rollout_deltas6.append(next6 - last6)   # actual rollout delta used
 
             seq_raw = torch.cat([seq_raw[:, 1:], next5.unsqueeze(1)], dim=1)
             seq_valid5 = torch.cat([seq_valid5[:, 1:], next_valid5.unsqueeze(1)], dim=1)
@@ -290,14 +332,53 @@ def train_one_epoch(
                 seq_delta_valid.unsqueeze(-1).float()
             ], dim=-1)
 
-            # keep frame-window length aligned with seq_delta
             last_frame = seq_frames[:, -1:].clone()
             seq_frames = torch.cat([seq_frames[:, 1:], last_frame], dim=1)
 
-        pred_fut6 = torch.stack(preds6, dim=1)
+        pred_fut6 = torch.stack(preds6, dim=1)                    # (B,P,M,6,2)
+        pred_rollout_deltas6 = torch.stack(pred_rollout_deltas6, dim=1)  # (B,P,M,6,2)
+
         pos_loss = (((pred_fut6 - gt_fut6) ** 2) * mask6).sum() / mask6.sum().clamp_min(1.0)
 
-        loss = w_pos * pos_loss + w_delta * delta_loss
+        # -------------------------
+        # (C) Direction loss on rollout deltas
+        # -------------------------
+        gt_prev6 = torch.cat([gt_fut6[:, :1], gt_fut6[:, :-1]], dim=1)   # temporary
+        # first future step should be relative to last observed frame, not gt_fut6[:, :1]
+        last_obs5_raw = obs_raw[:, -1]
+        last_obs5_valid = torch.isfinite(last_obs5_raw).all(dim=-1)
+        last_obs5_clean = torch.nan_to_num(last_obs5_raw, nan=0.0)
+        last_obs_feat = torch.cat([
+            last_obs5_clean.unsqueeze(1),
+            last_obs5_valid.unsqueeze(1).unsqueeze(-1).float()
+        ], dim=-1)
+        last_obs6 = model.encoder.add_virtual_root(last_obs_feat)[..., :2]   # (B,1,M,6,2)
+
+        gt_prev6 = torch.cat([last_obs6, gt_fut6[:, :-1]], dim=1)            # (B,P,M,6,2)
+        gt_rollout_deltas6 = gt_fut6 - gt_prev6                              # (B,P,M,6,2)
+
+        dir_mask = valid6   # (B,P,M,6)
+        dir_loss = _direction_loss(
+            pred_rollout_deltas6,
+            gt_rollout_deltas6,
+            mask=dir_mask,
+            min_speed=1.0
+        )
+
+        # optional magnitude loss, useful if predictions are too short
+        mag_loss = (
+            (
+                torch.norm(pred_rollout_deltas6, dim=-1) -
+                torch.norm(gt_rollout_deltas6, dim=-1)
+            ) ** 2
+        )
+        mag_loss = (mag_loss * dir_mask.float()).sum() / dir_mask.float().sum().clamp_min(1.0)
+
+        # -------------------------
+        # Final loss
+        # -------------------------
+        loss = w_pos * pos_loss + w_delta * delta_loss + w_dir * dir_loss + w_mag * mag_loss
+
         if torch.isnan(loss) or torch.isinf(loss):
             continue
 
@@ -310,19 +391,29 @@ def train_one_epoch(
         total += float(loss.item())
         n += 1
 
+        pbar.set_postfix({
+            "loss": f"{loss.item():.4f}",
+            "pos": f"{pos_loss.item():.4f}",
+            "delta": f"{delta_loss.item():.4f}",
+            "dir": f"{dir_loss.item():.4f}",
+            "mag": f"{mag_loss.item():.4f}",
+        })
+
     return total / max(n, 1)
+
 
 @torch.no_grad()
 def evaluate_one_epoch(
     model, dataloader, device, O, P,
-    w_pos=1.0, w_delta=0.5
+    w_pos=1.0, w_delta=0.5, w_dir=0.2, w_mag=0.1
 ):
     model.eval()
     total, n = 0.0, 0
     total_pos, total_delta = 0.0, 0.0
-    
+    total_dir, total_mag = 0.0, 0.0
+
     pbar = tqdm(dataloader, desc="Eval", leave=False)
-     
+
     for batch in pbar:
         obs_raw = batch["obs"].to(device).float()
         fut_raw = batch["fut"].to(device).float()
@@ -332,6 +423,9 @@ def evaluate_one_epoch(
         obs = torch.nan_to_num(obs_raw, nan=0.0)
         fut = torch.nan_to_num(fut_raw, nan=0.0)
 
+        # --------------------------------
+        # (A) Teacher-forced delta loss
+        # --------------------------------
         full_raw = torch.cat([obs_raw, fut_raw], dim=1)
         gt_delta, mask_delta, full_delta_in, full_clean = _make_gt_and_mask(model, full_raw)
 
@@ -341,21 +435,27 @@ def evaluate_one_epoch(
 
         delta_loss = ((pred_delta_tf - gt_delta) ** 2 * mask_delta).sum() / mask_delta.sum().clamp_min(1.0)
 
+        # --------------------------------
+        # (B) GT future absolute positions
+        # --------------------------------
         fut_valid5 = torch.isfinite(fut_raw).all(dim=-1)
         fut_clean = torch.nan_to_num(fut_raw, nan=0.0)
         fut_feat = torch.cat([
             fut_clean,
             fut_valid5.unsqueeze(-1).float()
-        ], dim=-1)                     # (B,P,M,5,3)
+        ], dim=-1)   # (B,P,M,5,3)
 
-        gt_fut6 = model.encoder.add_virtual_root(fut_feat)[..., :2]
+        gt_fut6 = model.encoder.add_virtual_root(fut_feat)[..., :2]   # (B,P,M,6,2)
 
         root_valid = fut_valid5.any(dim=-1, keepdim=True)
-        valid6 = torch.cat([fut_valid5, root_valid], dim=-1)
-        mask6 = valid6.unsqueeze(-1).expand(-1, -1, -1, -1, 2).float()
+        valid6 = torch.cat([fut_valid5, root_valid], dim=-1)          # (B,P,M,6)
+        mask6 = valid6.unsqueeze(-1).float()                          # (B,P,M,6,1)
 
         B, _, M, _, _ = obs.shape
 
+        # --------------------------------
+        # (C) Autoregressive rollout
+        # --------------------------------
         seq_raw = obs_raw.clone()
         seq_clean = obs.clone()
         seq_valid5 = torch.isfinite(seq_raw).all(dim=-1)
@@ -367,10 +467,13 @@ def evaluate_one_epoch(
         seq_delta = torch.cat([
             seq_delta_xy,
             seq_delta_valid.unsqueeze(-1).float()
-        ], dim=-1)
+        ], dim=-1)   # (B,O-1,M,5,3)
+
+        seq_frames = obs_frames.clone()
 
         preds6 = []
-        seq_frames = obs_frames.clone()
+        pred_rollout_deltas6 = []
+
         for _step in range(P):
             out = model(seq_delta, seq_frames)
             mu = _as_delta_pred(out)
@@ -383,9 +486,9 @@ def evaluate_one_epoch(
             last_feat = torch.cat([
                 last5_clean.unsqueeze(1),
                 last_valid5.unsqueeze(1).unsqueeze(-1).float()
-            ], dim=-1)                                  # (B,1,M,5,3)
+            ], dim=-1)
 
-            last6 = model.encoder.add_virtual_root(last_feat)[:, 0, ..., :2]
+            last6 = model.encoder.add_virtual_root(last_feat)[:, 0, ..., :2]   # (B,M,6,2)
 
             next6 = last6 + dpos6
             next5 = next6[:, :, :5, :]
@@ -394,11 +497,12 @@ def evaluate_one_epoch(
             next_feat = torch.cat([
                 next5.unsqueeze(1),
                 next_valid5.unsqueeze(1).unsqueeze(-1).float()
-            ], dim=-1)                                  # (B,1,M,5,3)
+            ], dim=-1)
 
             next6 = model.encoder.add_virtual_root(next_feat)[:, 0, ..., :2]
 
             preds6.append(next6)
+            pred_rollout_deltas6.append(next6 - last6)
 
             seq_raw = torch.cat([seq_raw[:, 1:], next5.unsqueeze(1)], dim=1)
             seq_valid5 = torch.cat([seq_valid5[:, 1:], next_valid5.unsqueeze(1)], dim=1)
@@ -412,41 +516,101 @@ def evaluate_one_epoch(
                 seq_delta_xy,
                 seq_delta_valid.unsqueeze(-1).float()
             ], dim=-1)
+
             last_frame = seq_frames[:, -1:].clone()
             seq_frames = torch.cat([seq_frames[:, 1:], last_frame], dim=1)
 
-        pred_fut6 = torch.stack(preds6, dim=1)
+        pred_fut6 = torch.stack(preds6, dim=1)                          # (B,P,M,6,2)
+        pred_rollout_deltas6 = torch.stack(pred_rollout_deltas6, dim=1) # (B,P,M,6,2)
+
         pos_loss = (((pred_fut6 - gt_fut6) ** 2) * mask6).sum() / mask6.sum().clamp_min(1.0)
 
-        combined = w_pos * pos_loss + w_delta * delta_loss
+        # --------------------------------
+        # (D) Direction + magnitude loss
+        # --------------------------------
+        last_obs5_raw = obs_raw[:, -1]
+        last_obs5_valid = torch.isfinite(last_obs5_raw).all(dim=-1)
+        last_obs5_clean = torch.nan_to_num(last_obs5_raw, nan=0.0)
+        last_obs_feat = torch.cat([
+            last_obs5_clean.unsqueeze(1),
+            last_obs5_valid.unsqueeze(1).unsqueeze(-1).float()
+        ], dim=-1)
+
+        last_obs6 = model.encoder.add_virtual_root(last_obs_feat)[..., :2]  # (B,1,M,6,2)
+
+        gt_prev6 = torch.cat([last_obs6, gt_fut6[:, :-1]], dim=1)            # (B,P,M,6,2)
+        gt_rollout_deltas6 = gt_fut6 - gt_prev6                              # (B,P,M,6,2)
+
+        dir_mask = valid6
+        dir_loss = _direction_loss(
+            pred_rollout_deltas6,
+            gt_rollout_deltas6,
+            mask=dir_mask,
+            min_speed=1.0
+        )
+
+        mag_loss = (
+            (
+                torch.norm(pred_rollout_deltas6, dim=-1) -
+                torch.norm(gt_rollout_deltas6, dim=-1)
+            ) ** 2
+        )
+        mag_loss = (mag_loss * dir_mask.float()).sum() / dir_mask.float().sum().clamp_min(1.0)
+
+        combined = w_pos * pos_loss + w_delta * delta_loss + w_dir * dir_loss + w_mag * mag_loss
+
         if torch.isnan(combined) or torch.isinf(combined):
             continue
 
         total += float(combined.item())
         total_pos += float(pos_loss.item())
         total_delta += float(delta_loss.item())
+        total_dir += float(dir_loss.item())
+        total_mag += float(mag_loss.item())
         n += 1
 
     if n == 0:
-        return {"loss": float("nan"), "pos_loss": float("nan"), "delta_loss": float("nan")}
+        return {
+            "loss": float("nan"),
+            "pos_loss": float("nan"),
+            "delta_loss": float("nan"),
+            "dir_loss": float("nan"),
+            "mag_loss": float("nan"),
+        }
 
-    return {"loss": total / n, "pos_loss": total_pos / n, "delta_loss": total_delta / n}
-
+    return {
+        "loss": total / n,
+        "pos_loss": total_pos / n,
+        "delta_loss": total_delta / n,
+        "dir_loss": total_dir / n,
+        "mag_loss": total_mag / n,
+    }
 
 # ----- training -----
 for epoch in range(NUM_EPOCHS):
-    train_loss = train_one_epoch(model, train_dl, optimizer, device, O, P, w_pos=0.01, w_delta=1.0)
-    eval_stats  = evaluate_one_epoch(model, test_dl, device, O, P, w_pos=0.01, w_delta=1.0)
-
+    train_loss = train_one_epoch(model, train_dl, optimizer, device, O, P, w_pos=w_pos, w_delta=w_delta, w_dir=w_dir, w_mag=w_mag)
+    metrics = evaluate_one_epoch(model, test_dl, device, O, P, w_pos=w_pos, w_delta=w_delta, w_dir=w_dir, w_mag=w_mag)
+    
     print(
         f"epoch {epoch}: "
         f"train={train_loss:.6f}, "
-        f"test_total={eval_stats['loss']:.6f}, "
-        f"test_pos={eval_stats['pos_loss']:.6f}, "
-        f"test_delta={eval_stats['delta_loss']:.6f}"
+        f"test_total={metrics['loss']:.6f}, "
+        f"test_pos={metrics['pos_loss']:.6f}, "
+        f"test_delta={metrics['delta_loss']:.6f}, "
+        f"test_dir={metrics['dir_loss']:.6f}, "
+        f"test_mag={metrics['mag_loss']:.6f}"
     )
-    wandb.log({"epoch": epoch, "train_loss": train_loss, "test_loss": eval_stats['loss']})
     
+    wandb.log({
+        "epoch": epoch,
+        "train_loss": train_loss,
+        "test_loss": metrics["loss"],
+        "test_pos": metrics["pos_loss"],
+        "test_delta": metrics["delta_loss"],
+        "test_dir": metrics["dir_loss"],
+        "test_mag": metrics["mag_loss"],
+    })
+
     if (epoch + 1) % SAVE_INTERVAL == 0:
         os.makedirs(f"models/model_weights_{wandb_timestamp}", exist_ok=True)
         torch.save(model.state_dict(), f"models/model_weights_{wandb_timestamp}/epoch{epoch}.pth")
