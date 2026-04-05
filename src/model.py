@@ -9,7 +9,7 @@ class FullModelWithResNet(nn.Module):
         self.encoder = traj_encoder
         self.vision_encoder = ResNetEncoder(out_dim=vision_dim, freeze=True)
 
-        Dgat = traj_encoder.gat_out_dim
+        Dgat = traj_encoder.out_dim
 
         self.fuse = nn.Sequential(
             nn.Linear(Dgat + vision_dim, fuse_dim),
@@ -51,7 +51,7 @@ class FullModelWithDINOv2(nn.Module):
             use_cls=False
         )
 
-        Dgat = traj_encoder.gat_out_dim
+        Dgat = traj_encoder.out_dim
         vis_dim = vision_dim * 2 if self.use_visual_diff else vision_dim
 
         self.fuse_in = nn.Sequential(
@@ -65,7 +65,18 @@ class FullModelWithDINOv2(nn.Module):
             num_layers=1,
             batch_first=True
         )
-
+        
+        #### Transformer 
+        # encoder_layer = nn.TransformerEncoderLayer(
+        #     d_model=fuse_dim,
+        #     nhead=4,
+        #     dim_feedforward=2 * fuse_dim,
+        #     dropout=0.1,
+        #     batch_first=True
+        # )
+        # self.post_temporal = nn.TransformerEncoder(encoder_layer, num_layers=1)
+        # self.pos_enc = PositionalEncoding(fuse_dim)
+        
         self.head = nn.Sequential(
             nn.Linear(fuse_dim, fuse_dim),
             nn.ReLU(),
@@ -84,7 +95,7 @@ class FullModelWithDINOv2(nn.Module):
 
         _, rhat = self.encoder(delta)                 # (B,T,N,Dg)
         B, T, N, Dg = rhat.shape
-        #BATCH NORM
+        
         vis = vis_feats                               # (B,T,V)
 
         if self.use_visual_diff:
@@ -101,8 +112,26 @@ class FullModelWithDINOv2(nn.Module):
         fused = fused.view(B * N, T, -1)                 # (B*N,T,F)
 
         fused, _ = self.post_gru(fused)                  # (B*N,T,F)
+        # fused = self.pos_enc(fused)
+        # fused = self.post_temporal(fused)
 
         out = self.head(fused)                           # (B*N,T,2)
         out = out.view(B, N, T, 2).permute(0, 2, 1, 3).contiguous()  # (B,T,N,2)
 
         return out
+    
+
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model, max_len=500):
+        super().__init__()
+        pe = torch.zeros(max_len, d_model)
+        pos = torch.arange(0, max_len).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2) * (-torch.log(torch.tensor(10000.0)) / d_model))
+
+        pe[:, 0::2] = torch.sin(pos * div_term)
+        pe[:, 1::2] = torch.cos(pos * div_term)
+
+        self.register_buffer("pe", pe.unsqueeze(0))  # (1, T, D)
+
+    def forward(self, x):
+        return x + self.pe[:, :x.size(1)]

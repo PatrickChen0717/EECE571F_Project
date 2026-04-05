@@ -15,8 +15,12 @@ device = "cpu"
 # conda activate py310
 
 # ----- build + load model -----
-encoder_hidden_size = 256
-encoder_embed_dim = 128
+encoder_hidden_size = 128
+encoder_embed_dim = 64
+O = 50
+P = 10
+batch_size = 64
+
 encoder = LSTM_gat(hidden_size=encoder_hidden_size, embed_dim=encoder_embed_dim)
 # model = FullModelWithResNet(encoder, vision_dim=128).to(device)
 model = FullModelWithDINOv2(encoder, vision_dim=128).to(device)
@@ -29,13 +33,10 @@ img_transform = transforms.Compose(
     ]
 )
 
-ckpt = "models/model_weights_2026-03-31_12-31-53/epoch31.pth"
+ckpt = "models/model_weights_2026-04-02_12-15-45/epoch48.pth"
+# ckpt = "models/model_weights_2026-03-31_19-05-26/epoch45.pth" # 128, 64, 2 GAT, GRU (current best model)
 model.load_state_dict(torch.load(ckpt, map_location=device))
 model.eval()
-
-O = 50
-P = 10
-batch_size = 64
 
 lp = sum(p.numel() for p in model.parameters() if p.requires_grad)
 print("Learnable parameters:", lp)
@@ -49,7 +50,7 @@ yaml_paths = paths_left
 print("num yamls found:", len(yaml_paths))
 
 random.seed(42)
-n_keep = max(1, int(0.5 * len(yaml_paths)))  # prevent 0
+n_keep = max(1, int(0.25 * len(yaml_paths)))   # prevent 0
 yaml_paths = random.sample(yaml_paths, n_keep)
 
 print("num yamls kept:", len(yaml_paths))
@@ -58,8 +59,8 @@ ds = KeypointDataset(
     yaml_paths=yaml_paths,
     normalize=False,
     smoothing=True,
-    smoothing_window=19,
-    load_features=True,
+    smoothing_window=101,
+    load_features=True
 )
 # dataset  = WindowedKeypointDataset(ds,  O=O, P=P, random_window=False, load_from_image=False)
 print("dataset size:", len(ds))
@@ -296,7 +297,7 @@ def predict_episode_blockwise_no_overlap(
 
 
 @torch.no_grad()
-def plot_full_episode(model, sample, device, instr_id=0, kp_id=0, O=10):
+def plot_full_episode(model, sample, device, sample_num, instr_id=0, kp_id=0, O=10, save_directory=None):
     x_full = torch.as_tensor(sample["x"]).float()
     x_full = x_full[..., :2]
 
@@ -369,27 +370,47 @@ def plot_full_episode(model, sample, device, instr_id=0, kp_id=0, O=10):
             shown_pred = True
 
     plt.gca().invert_yaxis()
-    plt.title(f"Instr {instr_id}, KP {kp_id} (O={O}, P={P})")
+    plt.title(f"Sample {sample_num}, Instr {instr_id}, KP {kp_id} (O={O}, P={P})")
     plt.xlabel("x")
     plt.ylabel("y")
     plt.legend()
     plt.tight_layout()
-
-    save_dir = os.path.join(os.getenv("BASE_DIR"), "outputs", "plots")
+    
+    if save_directory is None:
+        save_dir = "/raid/home/patrickbyc/EECE571F_Project/outputs/plots"
+    else:
+        save_dir = save_directory
     os.makedirs(save_dir, exist_ok=True)
 
-    save_path = os.path.join(save_dir, f"traj_instr{instr_id}_kp{kp_id}.png")
+    save_path = os.path.join(save_dir, f"traj_sample{sample_num}_instr{instr_id}_kp{kp_id}.png")
     print(save_path)
     plt.savefig(save_path, dpi=200)
     plt.close()
 
+def run_through_all_sample(num_samples):
+    batch = next(iter(test_dl))
+    save_dir = "/raid/home/patrickbyc/EECE571F_Project/outputs/fine_plots2"
+    
+    for i in range(num_samples):
+        sample = {}
+        for k, v in batch.items():
+            sample[k] = v[i]
+
+        for instr_id in range(2):
+            for kp_id in range(5):
+                plot_full_episode(model, sample, device=device, sample_num=i, instr_id=instr_id, kp_id=kp_id, O=O, save_directory=save_dir)
+
 
 # ---- run one sample ----
-batch = next(iter(test_dl))
-i = 4
 
-sample = {}
-for k, v in batch.items():
-    sample[k] = v[i]
+# batch = next(iter(test_dl))
+# i = 4
 
-plot_full_episode(model, sample, device=device, instr_id=1, kp_id=1, O=O)
+# sample = {}
+# for k, v in batch.items():
+#     sample[k] = v[i]
+
+# plot_full_episode(model, sample, device=device, sample_num=i, instr_id=1, kp_id=4, O=O)
+
+# ---- run all sample ----
+run_through_all_sample(len(yaml_paths))
