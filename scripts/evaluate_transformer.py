@@ -3,9 +3,7 @@ from torch.utils.data import DataLoader
 import matplotlib.pyplot as plt
 import glob, random
 
-from src.LSTM import LSTM_gat
-from src.model import FullModelWithResNet
-from src.model import FullModelWithDINOv2
+from src.transformer import TransformerTrajectoryModel
 from data.dataloader import KeypointDataset, WindowedKeypointDataset
 from PIL import Image
 from torchvision import transforms
@@ -15,15 +13,26 @@ device = "cpu"
 # conda activate py310
 
 # ----- build + load model -----
-encoder_hidden_size = 128
-encoder_embed_dim = 64
+vision_dim=128
+d_model=128
+nhead=4
+num_layers=2
+ff_dim=256
+dropout=0.1
+
 O = 50
 P = 10
 batch_size = 64
 
-encoder = LSTM_gat(hidden_size=encoder_hidden_size, embed_dim=encoder_embed_dim)
-# model = FullModelWithResNet(encoder, vision_dim=128).to(device)
-model = FullModelWithDINOv2(encoder, vision_dim=128).to(device)
+model = TransformerTrajectoryModel(
+    M=2,
+    vision_dim=vision_dim,
+    d_model=d_model,
+    nhead=nhead,
+    num_layers=num_layers,
+    ff_dim=ff_dim,
+    dropout=dropout,
+).to(device)
 
 img_transform = transforms.Compose([
     transforms.Resize((224, 224)),
@@ -34,8 +43,8 @@ img_transform = transforms.Compose([
     )
 ])
 
-# ckpt = "models/model_weights_2026-04-02_12-15-45/epoch48.pth"
-ckpt = "models/model_weights_2026-03-31_19-05-26/epoch45.pth" # 128, 64, 2 GAT, GRU (current best model)
+ckpt = "models_transformers/model_weights_2026-04-05_12-30-15/epoch54.pth"
+# ckpt = "models/model_weights_2026-03-31_19-05-26/epoch45.pth" # 128, 64, 2 GAT, GRU (current best model)
 model.load_state_dict(torch.load(ckpt, map_location=device))
 model.eval()
 
@@ -128,6 +137,22 @@ def _mu_from_model_out(out):
         return out[..., 0:2]
     raise RuntimeError(f"Unexpected output last dim C={C}")
 
+def add_virtual_root_from_xy(feat):
+    """
+    feat: (B,T,M,5,3) where last dim = [x, y, valid]
+    returns: (B,T,M,6,3)
+    root = mean of valid keypoints
+    """
+    xy = feat[..., :2]                    # (B,T,M,5,2)
+    valid = feat[..., 2] > 0.5            # (B,T,M,5)
+
+    valid_f = valid.unsqueeze(-1).float() # (B,T,M,5,1)
+    denom = valid_f.sum(dim=3, keepdim=True).clamp_min(1.0)
+    root_xy = (xy * valid_f).sum(dim=3, keepdim=True) / denom   # (B,T,M,1,2)
+    root_valid = valid.any(dim=3, keepdim=True).float().unsqueeze(-1)  # (B,T,M,1,1)
+
+    root = torch.cat([root_xy, root_valid], dim=-1)             # (B,T,M,1,3)
+    return torch.cat([feat, root], dim=3)                       # (B,T,M,6,3)
 
 def add_virtual_root_with_model(model, x5, valid5=None):
     """
@@ -150,7 +175,7 @@ def add_virtual_root_with_model(model, x5, valid5=None):
             valid5_bt = valid5.unsqueeze(0).unsqueeze(0)
         x5_clean = torch.nan_to_num(x5_bt, nan=0.0)
         feat_bt = torch.cat([x5_clean, valid5_bt.unsqueeze(-1).float()], dim=-1)  # (1,1,M,5,3)
-        x6_bt = model.encoder.add_virtual_root(feat_bt)[..., :2]  # (1,1,M,6,2)
+        x6_bt = add_virtual_root_from_xy(feat_bt)[..., :2]  # (1,1,M,6,2)
         return x6_bt[0, 0]
 
     elif x5.dim() == 4:
@@ -161,7 +186,7 @@ def add_virtual_root_with_model(model, x5, valid5=None):
             valid5_bt = valid5.unsqueeze(0)
         x5_clean = torch.nan_to_num(x5_bt, nan=0.0)
         feat_bt = torch.cat([x5_clean, valid5_bt.unsqueeze(-1).float()], dim=-1)  # (1,T,M,5,3)
-        x6_bt = model.encoder.add_virtual_root(feat_bt)[..., :2]  # (1,T,M,6,2)
+        x6_bt = add_virtual_root_from_xy(feat_bt)[..., :2]  # (1,T,M,6,2)
         return x6_bt[0]
 
     elif x5.dim() == 5:
@@ -169,7 +194,7 @@ def add_virtual_root_with_model(model, x5, valid5=None):
             valid5 = torch.isfinite(x5).all(dim=-1)
         x5_clean = torch.nan_to_num(x5, nan=0.0)
         feat = torch.cat([x5_clean, valid5.unsqueeze(-1).float()], dim=-1)  # (B,T,M,5,3)
-        return model.encoder.add_virtual_root(feat)[..., :2]
+        return add_virtual_root_from_xy(feat)[..., :2]
 
     else:
         raise ValueError(f"Unexpected x5 dim: {x5.dim()}")
@@ -367,7 +392,7 @@ def plot_full_episode(model, sample, device, sample_num, instr_id=0, kp_id=0, O=
     plt.tight_layout()
     
     if save_directory is None:
-        save_dir = "/raid/home/patrickbyc/EECE571F_Project/outputs/plots"
+        save_dir = "/raid/home/patrickbyc/EECE571F_Project/outputs/transformer_plots"
     else:
         save_dir = save_directory
     os.makedirs(save_dir, exist_ok=True)
@@ -379,7 +404,7 @@ def plot_full_episode(model, sample, device, sample_num, instr_id=0, kp_id=0, O=
 
 def run_through_all_sample(num_samples):
     batch = next(iter(test_dl))
-    save_dir = "/raid/home/patrickbyc/EECE571F_Project/outputs/fine_plots2"
+    save_dir = "/raid/home/patrickbyc/EECE571F_Project/outputs/transformer_fine_plots"
     
     for i in range(num_samples):
         sample = {}
