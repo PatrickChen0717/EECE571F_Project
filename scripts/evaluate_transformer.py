@@ -3,9 +3,7 @@ from torch.utils.data import DataLoader
 import matplotlib.pyplot as plt
 import glob, random
 
-from src.LSTM import LSTM_gat
-from src.model import FullModelWithResNet
-from src.model import FullModelWithDINOv2
+from src.transformer import TransformerTrajectoryModel
 from data.dataloader import KeypointDataset, WindowedKeypointDataset
 from PIL import Image
 from torchvision import transforms
@@ -15,26 +13,38 @@ device = "cpu"
 # conda activate py310
 
 # ----- build + load model -----
-encoder_hidden_size = 128
-encoder_embed_dim = 64
+vision_dim=128
+d_model=128
+nhead=4
+num_layers=2
+ff_dim=256
+dropout=0.1
+
 O = 50
 P = 10
 batch_size = 64
 
-encoder = LSTM_gat(hidden_size=encoder_hidden_size, embed_dim=encoder_embed_dim)
-# model = FullModelWithResNet(encoder, vision_dim=128).to(device)
-model = FullModelWithDINOv2(encoder, vision_dim=128).to(device)
+model = TransformerTrajectoryModel(
+    M=2,
+    vision_dim=vision_dim,
+    d_model=d_model,
+    nhead=nhead,
+    num_layers=num_layers,
+    ff_dim=ff_dim,
+    dropout=dropout,
+).to(device)
 
-img_transform = transforms.Compose(
-    [
-        transforms.Resize((224, 224)),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-    ]
-)
+img_transform = transforms.Compose([
+    transforms.Resize((224, 224)),
+    transforms.ToTensor(),
+    transforms.Normalize(
+        mean=[0.485, 0.456, 0.406],
+        std=[0.229, 0.224, 0.225]
+    )
+])
 
-# ckpt = "models/model_weights_2026-04-02_12-15-45/epoch48.pth"
-ckpt = "models/model_weights_2026-03-31_19-05-26/epoch45.pth" # 128, 64, 2 GAT, GRU (current best model)
+ckpt = "models_transformers/model_weights_2026-04-05_12-30-15/epoch54.pth"
+# ckpt = "models/model_weights_2026-03-31_19-05-26/epoch45.pth" # 128, 64, 2 GAT, GRU (current best model)
 model.load_state_dict(torch.load(ckpt, map_location=device))
 model.eval()
 
@@ -43,7 +53,8 @@ print("Learnable parameters:", lp)
 
 # ----- dataset -----
 paths_left = glob.glob(
-    os.path.join(os.getenv("SURGPOSE_DIR"), "**", "keypoints_left.yaml"), recursive=True
+    "/raid/home/patrickbyc/SurgPose_dataset_no_vid/**/keypoints_left.yaml",
+    recursive=True
 )
 yaml_paths = paths_left
 
@@ -93,9 +104,8 @@ def get_frame_path(episode_path, frame_idx):
 def load_frame_tensor(episode_path, frame_idx, device="cpu"):
     frame_path = get_frame_path(episode_path, frame_idx)
     img = Image.open(frame_path).convert("RGB")
-    frame = img_transform(img).unsqueeze(0).to(device)  # (1,3,224,224)
+    frame = img_transform(img).unsqueeze(0).to(device)   # (1,3,224,224)
     return frame
-
 
 def load_feature_tensor(episode_path, frame_idx, device="cpu"):
     if isinstance(episode_path, list):
@@ -104,14 +114,16 @@ def load_feature_tensor(episode_path, frame_idx, device="cpu"):
     episode_dir = os.path.dirname(episode_path)
 
     feat_path = os.path.join(
-        episode_dir, "regular/left_frame_pt", f"{frame_idx:06d}.pt"
+        episode_dir,
+        "regular/left_frame_pt",
+        f"{frame_idx:06d}.pt"
     )
 
     if not os.path.exists(feat_path):
         raise FileNotFoundError(f"Feature not found: {feat_path}")
 
-    feat = torch.load(feat_path, map_location=device)  # (D,)
-    return feat.unsqueeze(0)  # (1,D)
+    feat = torch.load(feat_path, map_location=device)   # (D,)
+    return feat.unsqueeze(0)   # (1,D)
 
 
 def _mu_from_model_out(out):
@@ -125,6 +137,22 @@ def _mu_from_model_out(out):
         return out[..., 0:2]
     raise RuntimeError(f"Unexpected output last dim C={C}")
 
+def add_virtual_root_from_xy(feat):
+    """
+    feat: (B,T,M,5,3) where last dim = [x, y, valid]
+    returns: (B,T,M,6,3)
+    root = mean of valid keypoints
+    """
+    xy = feat[..., :2]                    # (B,T,M,5,2)
+    valid = feat[..., 2] > 0.5            # (B,T,M,5)
+
+    valid_f = valid.unsqueeze(-1).float() # (B,T,M,5,1)
+    denom = valid_f.sum(dim=3, keepdim=True).clamp_min(1.0)
+    root_xy = (xy * valid_f).sum(dim=3, keepdim=True) / denom   # (B,T,M,1,2)
+    root_valid = valid.any(dim=3, keepdim=True).float().unsqueeze(-1)  # (B,T,M,1,1)
+
+    root = torch.cat([root_xy, root_valid], dim=-1)             # (B,T,M,1,3)
+    return torch.cat([feat, root], dim=3)                       # (B,T,M,6,3)
 
 def add_virtual_root_with_model(model, x5, valid5=None):
     """
@@ -146,10 +174,8 @@ def add_virtual_root_with_model(model, x5, valid5=None):
         else:
             valid5_bt = valid5.unsqueeze(0).unsqueeze(0)
         x5_clean = torch.nan_to_num(x5_bt, nan=0.0)
-        feat_bt = torch.cat(
-            [x5_clean, valid5_bt.unsqueeze(-1).float()], dim=-1
-        )  # (1,1,M,5,3)
-        x6_bt = model.encoder.add_virtual_root(feat_bt)[..., :2]  # (1,1,M,6,2)
+        feat_bt = torch.cat([x5_clean, valid5_bt.unsqueeze(-1).float()], dim=-1)  # (1,1,M,5,3)
+        x6_bt = add_virtual_root_from_xy(feat_bt)[..., :2]  # (1,1,M,6,2)
         return x6_bt[0, 0]
 
     elif x5.dim() == 4:
@@ -159,20 +185,16 @@ def add_virtual_root_with_model(model, x5, valid5=None):
         else:
             valid5_bt = valid5.unsqueeze(0)
         x5_clean = torch.nan_to_num(x5_bt, nan=0.0)
-        feat_bt = torch.cat(
-            [x5_clean, valid5_bt.unsqueeze(-1).float()], dim=-1
-        )  # (1,T,M,5,3)
-        x6_bt = model.encoder.add_virtual_root(feat_bt)[..., :2]  # (1,T,M,6,2)
+        feat_bt = torch.cat([x5_clean, valid5_bt.unsqueeze(-1).float()], dim=-1)  # (1,T,M,5,3)
+        x6_bt = add_virtual_root_from_xy(feat_bt)[..., :2]  # (1,T,M,6,2)
         return x6_bt[0]
 
     elif x5.dim() == 5:
         if valid5 is None:
             valid5 = torch.isfinite(x5).all(dim=-1)
         x5_clean = torch.nan_to_num(x5, nan=0.0)
-        feat = torch.cat(
-            [x5_clean, valid5.unsqueeze(-1).float()], dim=-1
-        )  # (B,T,M,5,3)
-        return model.encoder.add_virtual_root(feat)[..., :2]
+        feat = torch.cat([x5_clean, valid5.unsqueeze(-1).float()], dim=-1)  # (B,T,M,5,3)
+        return add_virtual_root_from_xy(feat)[..., :2]
 
     else:
         raise ValueError(f"Unexpected x5 dim: {x5.dim()}")
@@ -190,28 +212,16 @@ def build_delta_with_vis(seq_raw):
     valid5 = torch.isfinite(seq_raw).all(dim=-1)
     seq_clean = torch.nan_to_num(seq_raw, nan=0.0)
 
-    delta_xy = (
-        seq_clean[1:] - seq_clean[:-1]
-        if seq_raw.dim() == 4
-        else seq_clean[:, 1:] - seq_clean[:, :-1]
-    )
-    valid_delta = (
-        valid5[1:] & valid5[:-1]
-        if seq_raw.dim() == 4
-        else valid5[:, 1:] & valid5[:, :-1]
-    )
+    delta_xy = seq_clean[1:] - seq_clean[:-1] if seq_raw.dim() == 4 else seq_clean[:, 1:] - seq_clean[:, :-1]
+    valid_delta = valid5[1:] & valid5[:-1] if seq_raw.dim() == 4 else valid5[:, 1:] & valid5[:, :-1]
 
-    delta_xy = torch.where(
-        valid_delta.unsqueeze(-1), delta_xy, torch.zeros_like(delta_xy)
-    )
+    delta_xy = torch.where(valid_delta.unsqueeze(-1), delta_xy, torch.zeros_like(delta_xy))
     delta_in = torch.cat([delta_xy, valid_delta.unsqueeze(-1).float()], dim=-1)
     return delta_in, seq_clean, valid5
 
 
 @torch.no_grad()
-def predict_episode_blockwise_no_overlap(
-    model, x_full, episode_path, O=30, P=10, device="cpu"
-):
+def predict_episode_blockwise_no_overlap(model, x_full, episode_path, O=30, P=10, device="cpu"):
     """
     Blockwise evaluation with NO overlap:
       block k uses GT obs [t:t+O) -> predicts [t+O:t+O+P)
@@ -243,9 +253,9 @@ def predict_episode_blockwise_no_overlap(
     stride = O + P
 
     while t + O <= L:
-        obs5_raw = x_full[t : t + O].clone()  # (O,M,5,2)
-        obs6 = gt5_to_6(obs5_raw)  # (O,M,6,2)
-        pred6[t : t + O] = obs6.cpu()
+        obs5_raw = x_full[t:t + O].clone()   # (O,M,5,2)
+        obs6 = gt5_to_6(obs5_raw)            # (O,M,6,2)
+        pred6[t:t + O] = obs6.cpu()
 
         if t + O >= L:
             break
@@ -255,20 +265,20 @@ def predict_episode_blockwise_no_overlap(
         # Load one feature for the conditioning frame of this block
         feat = load_feature_tensor(episode_path, frame_idx, device=device)  # (1,D)
 
-        seq_raw = obs5_raw.clone()  # (O,M,5,2), may contain NaN
-        last6 = obs6[-1].cpu()  # (M,6,2)
+        seq_raw = obs5_raw.clone()    # (O,M,5,2), may contain NaN
+        last6 = obs6[-1].cpu()        # (M,6,2)
 
         maxP = min(P, L - (t + O))
         for k in range(maxP):
-            win_delta, _, _ = build_delta_with_vis(seq_raw)  # (O-1,M,5,3)
-            win_in = win_delta.unsqueeze(0).to(device)  # (1,O-1,M,5,3)
+            win_delta, _, _ = build_delta_with_vis(seq_raw)   # (O-1,M,5,3)
+            win_in = win_delta.unsqueeze(0).to(device)        # (1,O-1,M,5,3)
 
             T = win_in.shape[1]
-            feat_seq = feat.unsqueeze(1).repeat(1, T, 1)  # (1,T,D)
+            feat_seq = feat.unsqueeze(1).repeat(1, T, 1)      # (1,T,D)
 
             out = model(win_in, feat_seq)
-            mu = _mu_from_model_out(out)  # (1,T,N,2) usually
-            dposN = mu[0, -1].detach().cpu()  # (N,2)
+            mu = _mu_from_model_out(out)                      # (1,T,N,2) usually
+            dposN = mu[0, -1].detach().cpu()                  # (N,2)
 
             if dposN.numel() != M * 6 * 2:
                 raise RuntimeError(
@@ -278,8 +288,8 @@ def predict_episode_blockwise_no_overlap(
 
             dpos6 = dposN.view(M, 6, 2)
 
-            next6 = last6 + dpos6  # (M,6,2)
-            next5 = next6[:, :5, :]  # (M,5,2)
+            next6 = last6 + dpos6           # (M,6,2)
+            next5 = next6[:, :5, :]         # (M,5,2)
             next_valid5 = torch.isfinite(next5).all(dim=-1)
 
             # recompute virtual root consistently
@@ -308,7 +318,12 @@ def plot_full_episode(model, sample, device, sample_num, instr_id=0, kp_id=0, O=
     valid_xy = torch.isfinite(x_full).all(dim=-1)
 
     pred6 = predict_episode_blockwise_no_overlap(
-        model, x_full, episode_path=sample["episode_path"], O=O, P=P, device=device
+        model,
+        x_full,
+        episode_path=sample["episode_path"],
+        O=O,
+        P=P,
+        device=device
     )
 
     gt_valid5 = torch.isfinite(x_full).all(dim=-1)
@@ -329,7 +344,7 @@ def plot_full_episode(model, sample, device, sample_num, instr_id=0, kp_id=0, O=
         gt_traj[mask][:, 1],
         color="black",
         linestyle="--",
-        label="GT Full",
+        label="GT Full"
     )
 
     stride = O + P
@@ -350,7 +365,7 @@ def plot_full_episode(model, sample, device, sample_num, instr_id=0, kp_id=0, O=
                 obs_block[obs_mask][:, 0],
                 obs_block[obs_mask][:, 1],
                 color="blue",
-                label="Observed (O)" if not shown_obs else None,
+                label="Observed (O)" if not shown_obs else None
             )
             shown_obs = True
 
@@ -365,7 +380,7 @@ def plot_full_episode(model, sample, device, sample_num, instr_id=0, kp_id=0, O=
                 fut_block[fut_mask][:, 0],
                 fut_block[fut_mask][:, 1],
                 color="red",
-                label="Predicted (P)" if not shown_pred else None,
+                label="Predicted (P)" if not shown_pred else None
             )
             shown_pred = True
 
@@ -377,7 +392,7 @@ def plot_full_episode(model, sample, device, sample_num, instr_id=0, kp_id=0, O=
     plt.tight_layout()
     
     if save_directory is None:
-        save_dir = "/raid/home/patrickbyc/EECE571F_Project/outputs/plots"
+        save_dir = "/raid/home/patrickbyc/EECE571F_Project/outputs/transformer_plots"
     else:
         save_dir = save_directory
     os.makedirs(save_dir, exist_ok=True)
@@ -389,7 +404,7 @@ def plot_full_episode(model, sample, device, sample_num, instr_id=0, kp_id=0, O=
 
 def run_through_all_sample(num_samples):
     batch = next(iter(test_dl))
-    save_dir = "/raid/home/patrickbyc/EECE571F_Project/outputs/fine_plots2"
+    save_dir = "/raid/home/patrickbyc/EECE571F_Project/outputs/transformer_fine_plots"
     
     for i in range(num_samples):
         sample = {}
