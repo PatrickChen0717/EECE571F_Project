@@ -135,26 +135,6 @@ def _as_delta_pred(model_out):
     else:
         raise RuntimeError(f"Unexpected model output last dim C={C}")
 
-def _make_input_delta(model, pos_raw):
-    """
-    pos_raw: (B,T,M,5,2) absolute positions with NaNs possible
-
-    returns:
-      delta_in: (B,T-1,M,5,2)   delta input for the model
-      pos_clean: (B,T,M,5,2)    cleaned absolute positions
-      valid_xy: (B,T,M,5)       validity of absolute positions
-    """
-    valid_xy = torch.isfinite(pos_raw).all(dim=-1)          # (B,T,M,5)
-    pos_clean = torch.nan_to_num(pos_raw, nan=0.0)          # (B,T,M,5,2)
-
-    delta_in = pos_clean[:, 1:] - pos_clean[:, :-1]         # (B,T-1,M,5,2)
-
-    # delta valid only if both endpoints valid
-    valid_delta = valid_xy[:, 1:] & valid_xy[:, :-1]        # (B,T-1,M,5)
-    delta_in = torch.where(valid_delta.unsqueeze(-1), delta_in, torch.zeros_like(delta_in))
-
-    return delta_in, pos_clean, valid_xy
-
 def _make_gt_and_mask(model, pos_raw):
     """
     pos_raw: (B,T,M,5,2)

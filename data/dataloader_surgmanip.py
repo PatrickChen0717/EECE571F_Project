@@ -225,22 +225,41 @@ def forward_fill_observation_window(
     Only fill the observation window before feeding into the model.
     Keep target frames untouched.
 
-    obs_coords: (O,10,2)
-    obs_vis:    (O,10)
-    returns filled_obs_coords: (O,10,2)
+    Supports either:
+      obs_coords: (O,10,2), obs_vis: (O,10)
+    or:
+      obs_coords: (O,2,5,2), obs_vis: (O,2,5)
+
+    Returns the filled coordinates with the same shape as the input.
     """
-    filled = obs_coords.copy()
+    if obs_coords.ndim == 4:
+        O, M, K, _ = obs_coords.shape
+        filled = obs_coords.reshape(O, M * K, 2).copy()
+        flat_vis = obs_vis.reshape(O, M * K)
+        reshape_back = (O, M, K, 2)
+    elif obs_coords.ndim == 3:
+        filled = obs_coords.copy()
+        flat_vis = obs_vis
+        reshape_back = None
+    else:
+        raise ValueError(
+            f"Expected obs_coords with ndim 3 or 4, got shape {obs_coords.shape}"
+        )
+
     O, N, _ = filled.shape
 
     for n in range(N):
         last_valid = None
         for t in range(O):
-            if obs_vis[t, n] > 0.5:
+            if flat_vis[t, n] > 0.5:
                 last_valid = filled[t, n].copy()
             else:
                 if last_valid is not None:
                     filled[t, n] = last_valid
                 # else leave as zero
+
+    if reshape_back is not None:
+        return filled.reshape(reshape_back)
     return filled
 
 
@@ -294,9 +313,13 @@ class SurgToolSequenceDataset(Dataset):
       {
         "obs_coords": (O,10,2),
         "obs_vis":    (O,10),
+        "obs_coords_by_tool": (O,2,5,2),
+        "obs_vis_by_tool":    (O,2,5),
         "obs_imgs":   (O,C,H,W) or (O,H,W,C) depending on transform,
         "fut_coords": (P,10,2),
         "fut_vis":    (P,10),
+        "fut_coords_by_tool": (P,2,5,2),
+        "fut_vis_by_tool":    (P,2,5),
         "fut_frame_idx": (P,),
         "obs_frame_idx": (O,)
       }
@@ -525,22 +548,43 @@ class SurgToolSequenceDataset(Dataset):
         frame_indices = np.array([fr["frame_idx"] for fr in chunk], dtype=np.int64)
         coords = np.stack([fr["coords"] for fr in chunk], axis=0)  # (O+P,10,2)
         vis = np.stack([fr["vis"] for fr in chunk], axis=0)  # (O+P,10)
+        coords_by_tool = coords.reshape(self.total_len, NUM_TOOLS, NUM_TOOL_KPTS, 2)
+        vis_by_tool = vis.reshape(self.total_len, NUM_TOOLS, NUM_TOOL_KPTS)
 
         obs_coords = coords[: self.obs_len].copy()
         obs_vis = vis[: self.obs_len].copy()
         fut_coords = coords[self.obs_len :].copy()
         fut_vis = vis[self.obs_len :].copy()
+        obs_coords_by_tool = coords_by_tool[: self.obs_len].copy()
+        obs_vis_by_tool = vis_by_tool[: self.obs_len].copy()
+        fut_coords_by_tool = coords_by_tool[self.obs_len :].copy()
+        fut_vis_by_tool = vis_by_tool[self.obs_len :].copy()
 
         # fill only observed sequence
         obs_coords_filled = forward_fill_observation_window(obs_coords, obs_vis)
+        obs_coords_by_tool_filled = forward_fill_observation_window(
+            obs_coords_by_tool, obs_vis_by_tool
+        )
 
         out = {
             "obs_coords": torch.tensor(
                 obs_coords_filled, dtype=torch.float32
             ),  # (O,10,2)
             "obs_vis": torch.tensor(obs_vis, dtype=torch.float32),  # (O,10)
+            "obs_coords_by_tool": torch.tensor(
+                obs_coords_by_tool_filled, dtype=torch.float32
+            ),  # (O,2,5,2)
+            "obs_vis_by_tool": torch.tensor(
+                obs_vis_by_tool, dtype=torch.float32
+            ),  # (O,2,5)
             "fut_coords": torch.tensor(fut_coords, dtype=torch.float32),  # (P,10,2)
             "fut_vis": torch.tensor(fut_vis, dtype=torch.float32),  # (P,10)
+            "fut_coords_by_tool": torch.tensor(
+                fut_coords_by_tool, dtype=torch.float32
+            ),  # (P,2,5,2)
+            "fut_vis_by_tool": torch.tensor(
+                fut_vis_by_tool, dtype=torch.float32
+            ),  # (P,2,5)
             "obs_frame_idx": torch.tensor(
                 frame_indices[: self.obs_len], dtype=torch.long
             ),
@@ -550,17 +594,16 @@ class SurgToolSequenceDataset(Dataset):
         }
 
         if self.include_features:
-            obs_feats = [
+            all_feats = [
                 self._load_feature(fr["frame_idx"], fr["feature_dir"])
-                for fr in chunk[: self.obs_len]
+                for fr in chunk
             ]
-            fut_feats = [
-                self._load_feature(fr["frame_idx"], fr["feature_dir"])
-                for fr in chunk[self.obs_len :]
-            ]
+            all_feats = torch.stack(all_feats, dim=0)  # (O+P,V)
 
-            out["obs_feats"] = torch.stack(obs_feats, dim=0)  # (O,V)
-            out["fut_feats"] = torch.stack(fut_feats, dim=0)  # (P,V)
+            out["obs_feats"] = all_feats[: self.obs_len]  # (O,V)
+            out["fut_feats"] = all_feats[self.obs_len :]  # (P,V)
+            out["obs_delta_feats"] = all_feats[1 : self.obs_len]  # (O-1,V)
+            out["full_feats"] = all_feats[1:]  # (O+P-1,V)
 
         if self.include_images:
             obs_imgs = [

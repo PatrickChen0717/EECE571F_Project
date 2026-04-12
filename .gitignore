@@ -12,3 +12,4 @@ models/*
 wandb/
 test/
 .env
+outputs/
