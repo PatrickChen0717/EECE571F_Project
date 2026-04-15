@@ -9,9 +9,6 @@ from data.dataloader_surgmanip import SurgToolSequenceDataset
 
 device = "cpu"
 
-# -----------------------------
-# config
-# -----------------------------
 O = 10
 P = 5
 BATCH = 1
@@ -24,9 +21,6 @@ ckpt = os.path.join(
     os.getenv("BASE_DIR"), "models", "model_weights_2026-03-30_12-48-31", "epoch47.pth"
 )
 
-# -----------------------------
-# build model
-# -----------------------------
 encoder = LSTM_gat(hidden_size=128, embed_dim=64)
 model = FullModelWithDINOv2(encoder, vision_dim=128, use_visual_diff=True).to(device)
 
@@ -36,9 +30,6 @@ model.eval()
 lp = sum(p.numel() for p in model.parameters() if p.requires_grad)
 print("Learnable parameters:", lp)
 
-# -----------------------------
-# dataset
-# -----------------------------
 ds = SurgToolSequenceDataset(
     xml_path=xml_path,
     image_dir=image_dir,
@@ -54,9 +45,6 @@ ds = SurgToolSequenceDataset(
 test_dl = DataLoader(ds, batch_size=BATCH, shuffle=False)
 
 
-# -----------------------------
-# helpers
-# -----------------------------
 def _mu_from_model_out(out):
     """
     out: (B,T,N,2) or (B,T,N,4)
@@ -141,7 +129,6 @@ def rollout_one_sample(model, sample, device="cpu"):
     full_vis = torch.cat([obs_vis, fut_vis], dim=1)  # (1,O+P,2,5)
     gt6_full, gt6_vis = add_root_to_coords(full_coords, full_vis)
 
-    # start predicted sequence with GT obs block
     obs6, _ = add_root_to_coords(obs_coords, obs_vis)
     preds6 = [obs6[:, t] for t in range(O)]  # list of (1,2,6,2)
 
@@ -171,7 +158,6 @@ def rollout_one_sample(model, sample, device="cpu"):
         seq_coords = torch.cat([seq_coords[:, 1:], next5.unsqueeze(1)], dim=1)
         seq_vis = torch.cat([seq_vis[:, 1:], next5_vis.unsqueeze(1)], dim=1)
 
-        # hold last visual feature for future rollout
         last_feat = seq_feats[:, -1:].clone()
         seq_feats = torch.cat([seq_feats[:, 1:], last_feat], dim=1)
 
@@ -239,7 +225,6 @@ def plot_batch_predictions(
 
         ax = axes[i]
 
-        # GT full trajectory
         if gt_mask.any():
             ax.plot(
                 gt_traj[gt_mask][:, 0],
@@ -257,7 +242,6 @@ def plot_batch_predictions(
         ax.set_title(f"Sample {i}")
         ax.invert_yaxis()
 
-    # legend (shared)
     fig.legend(["GT", "Observed", "Predicted"], loc="upper right")
     plt.tight_layout()
     plt.show()

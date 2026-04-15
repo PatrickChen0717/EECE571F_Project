@@ -1,107 +1,100 @@
-<!-- Instruction:
-1. set wandb user key or set Enable_WandB == False  in train.py
-wandb.login(key="")
-2. O and P means using previous O frame to predict the following P
-3. M is how many instruments in the image
+# LSTM + GAT SurgPose Trajectory Prediction
 
-Model Structure:
-(B, T, M, 5, 2)
-B = batch size
-T = time steps
-M = number of instruments
-5 = keypoints per instrument
-2 = (x, y)
+EECE 571F project for surgical instrument trajectory prediction on the SurgPose dataset.
 
-1. input phi Φ embedding, linear layer
-2. Vanilla LSTM
-3. GAT  -->
+The main workflow in this repository uses `python -m scripts.train_surgpose` for training and `python -m scripts.evaluate_surgpose` for evaluation.
 
-# Trajectory Prediction of DVRK Joints By LSTM with Graph Attention
-EECE 571F Project
+## Project Summary
 
+This project combines:
 
+- an LSTM-based temporal encoder
+- a Graph Attention Network (GAT) for spatial reasoning over keypoints
+- DINOv2 visual features for image conditioning
 
+The goal is to predict future surgical tool keypoint trajectories from observed motion.
 
-## Instructions
+## Data Representation
 
-### 1. Weights & Biases (W&B) Setup
+The motion input uses shape `(B, T, M, 5, 2)`:
 
-Before training, either set your W&B API key in `train.py`:
+- `B`: batch size
+- `T`: time steps
+- `M`: number of instruments
+- `5`: keypoints per instrument
+- `2`: `(delta x, delta y)` motion values
 
-wandb.login(key="YOUR_KEY")
+The pipeline also includes:
 
-Or disable W&B logging:
+- a visibility flag for each keypoint
+- a virtual root node for each instrument
+- frame-level visual features for conditioning
 
-Enable_WandB = False
+## Important Symbols
 
----
+- `O`: number of observed frames
+- `P`: number of future frames to predict
+- `M`: number of instruments in each frame
 
-### 2. Meaning of O and P
+The model uses the previous `O` frames to predict the next `P` frames.
 
-- O = number of observed frames  
-- P = number of future frames to predict  
+## Main Scripts
 
-The model uses:
+### Training
 
-Previous O frames → Predict next P frames
+```bash
+python -m scripts.train_surgpose
+```
 
----
+This script:
 
-### 3. Meaning of M
+- loads SurgPose keypoint annotations
+- builds windowed observation and prediction sequences
+- trains the LSTM+GAT model with visual features
+- saves checkpoints under `models/`
 
-M = number of surgical instruments in each frame.
-- M = 2 → two instruments (e.g., left & right tools)
+### Evaluation
 
-Each instrument contains 5 keypoints.
+```bash
+python -m scripts.evaluate_surgpose
+```
 
----
+This script:
 
-## Model Structure
+- loads a trained checkpoint
+- runs blockwise trajectory prediction
+- generates trajectory plots for the evaluation set
 
-Input tensor shape:
+## Other Baseline Models
 
-(B, T, M, 5, 2)
+Other baseline models can be trained and evaluated using:
 
-Where:
+- `python -m scripts.train_lstm` and `python -m scripts.evaluate_lstm`
+- `python -m scripts.train_transformer` and `python -m scripts.evaluate_transformer`
 
-- B = batch size  
-- T = time steps  
-- M = number of instruments  
-- 5 = keypoints per instrument  
-- 2 = (x, y) coordinates  
+## Model Overview
 
-## Architecture
+The full pipeline is:
 
-### 1. Φ Embedding (Input Projection)
+1. Encode motion deltas from observed keypoints.
+2. Model temporal dynamics with LSTM.
+3. Model spatial relations with GAT.
+4. Fuse trajectory features with visual features.
+5. Predict future keypoint motion.
 
-- Linear layer applied to raw keypoint positions  
-- Embeds coordinates into feature space  
+## Training Objective
 
-### 2. Temporal Modeling — Vanilla LSTM
+The training script uses:
 
-- Processes feature sequences over time  
-- Learns motion dynamics  
+- position loss
+- delta loss
+- direction loss
+- magnitude loss
 
-### 3. Spatial Modeling — Graph Attention Network (GAT)
+Ground-truth motion is computed from frame-to-frame position differences.
 
-- Models spatial relationships between:
-  - Keypoints
-  - Virtual root node (instrument center)
-  - (If M > 1) interactions between instruments
+## Notes
 
-
-
-## Other
-
-Ground-truth delta:
-
-Δpos_t = pos_{t+1} − pos_t
-
-Loss: Masked MSE
-
-
-## Run
-
-python -m scripts.train
-
-python -m scripts.evaluate
+- Update dataset paths in the SurgPose scripts if your dataset is stored in a different location.
+- `scripts/train_surgpose.py` currently uses Weights & Biases logging.
+- `scripts/evaluate_surgpose.py` contains a checkpoint path that should be changed to the model you want to evaluate.

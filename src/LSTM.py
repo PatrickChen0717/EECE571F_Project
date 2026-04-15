@@ -41,7 +41,7 @@ class LSTM_gat(nn.Module):
         )
 
         # output dims
-        self.gat_out_dim = hidden_size          # keep for compatibility
+        self.gat_out_dim = hidden_size 
         self.out_dim = hidden_size * 2          # [r || l]
 
     @staticmethod

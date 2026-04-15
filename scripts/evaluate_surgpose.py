@@ -12,9 +12,6 @@ from torchvision import transforms
 import os
 
 device = "cpu"
-# conda activate py310
-
-# ----- build + load model -----
 encoder_hidden_size = 128
 encoder_embed_dim = 64
 O = 50
@@ -22,7 +19,6 @@ P = 10
 batch_size = 64
 
 encoder = LSTM_gat(hidden_size=encoder_hidden_size, embed_dim=encoder_embed_dim)
-# model = FullModelWithResNet(encoder, vision_dim=128).to(device)
 model = FullModelWithDINOv2(encoder, vision_dim=128).to(device)
 
 img_transform = transforms.Compose(
@@ -33,15 +29,13 @@ img_transform = transforms.Compose(
     ]
 )
 
-# ckpt = "models/model_weights_2026-04-02_12-15-45/epoch48.pth"
-ckpt = "models/model_weights_2026-03-31_19-05-26/epoch45.pth" # 128, 64, 2 GAT, GRU (current best model)
+ckpt = "models/model_weights_2026-03-31_19-05-26/epoch45.pth"
 model.load_state_dict(torch.load(ckpt, map_location=device))
 model.eval()
 
 lp = sum(p.numel() for p in model.parameters() if p.requires_grad)
 print("Learnable parameters:", lp)
 
-# ----- dataset -----
 paths_left = glob.glob(
     os.path.join(os.getenv("SURGPOSE_DIR"), "**", "keypoints_left.yaml"), recursive=True
 )
@@ -50,7 +44,7 @@ yaml_paths = paths_left
 print("num yamls found:", len(yaml_paths))
 
 random.seed(42)
-n_keep = max(1, int(0.25 * len(yaml_paths)))   # prevent 0
+n_keep = max(1, int(0.25 * len(yaml_paths)))
 yaml_paths = random.sample(yaml_paths, n_keep)
 
 print("num yamls kept:", len(yaml_paths))
@@ -62,7 +56,6 @@ ds = KeypointDataset(
     smoothing_window=101,
     load_features=True
 )
-# dataset  = WindowedKeypointDataset(ds,  O=O, P=P, random_window=False, load_from_image=False)
 print("dataset size:", len(ds))
 
 test_dl = DataLoader(ds, batch_size=batch_size, shuffle=False)
@@ -252,7 +245,6 @@ def predict_episode_blockwise_no_overlap(
 
         frame_idx = t + O - 1
 
-        # Load one feature for the conditioning frame of this block
         feat = load_feature_tensor(episode_path, frame_idx, device=device)  # (1,D)
 
         seq_raw = obs5_raw.clone()  # (O,M,5,2), may contain NaN
@@ -282,13 +274,11 @@ def predict_episode_blockwise_no_overlap(
             next5 = next6[:, :5, :]  # (M,5,2)
             next_valid5 = torch.isfinite(next5).all(dim=-1)
 
-            # recompute virtual root consistently
             next6 = add_virtual_root_with_model(model, next5, next_valid5).cpu()
 
             pred6[t + O + k] = next6
             last6 = next6
 
-            # autoregressive update of obs window
             seq_raw = torch.cat([seq_raw[1:], next5.unsqueeze(0)], dim=0)
 
         t += stride
@@ -400,17 +390,4 @@ def run_through_all_sample(num_samples):
             for kp_id in range(5):
                 plot_full_episode(model, sample, device=device, sample_num=i, instr_id=instr_id, kp_id=kp_id, O=O, save_directory=save_dir)
 
-
-# ---- run one sample ----
-
-# batch = next(iter(test_dl))
-# i = 4
-
-# sample = {}
-# for k, v in batch.items():
-#     sample[k] = v[i]
-
-# plot_full_episode(model, sample, device=device, sample_num=i, instr_id=1, kp_id=4, O=O)
-
-# ---- run all sample ----
 run_through_all_sample(len(yaml_paths))
