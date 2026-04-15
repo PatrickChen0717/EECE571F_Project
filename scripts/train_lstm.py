@@ -19,7 +19,7 @@ wandb.login(key="8b49b325ce8e9e788b2981b63eebbc01ee33bc6b")
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
-# ----- fake dataset example -----
+# ----- dataset example -----
 SAVE_INTERVAL = 1
 NUM_EPOCHS = 150
 BATCH = 64
@@ -43,7 +43,6 @@ w_mag = 0.3
 
 base = Path("/raid/home/patrickbyc/SurgPose_dataset_no_vid")
 paths_left = list(base.rglob("keypoints_left.yaml"))
-# paths_right = glob.glob(r"C:\Users\Patrick\Documents\eece571F\SurgPose_dataset\**\keypoints_right.yaml", recursive=True)
 
 yaml_paths = paths_left
 

@@ -9,9 +9,6 @@ from data.dataloader_surgmanip import SurgToolSequenceDataset
 
 device = "cpu"
 
-# -----------------------------
-# config
-# -----------------------------
 O = 10
 P = 5
 BATCH = 1
@@ -22,9 +19,6 @@ feature_dir = r"C:\Users\Patrick\Downloads\surgmanip_pb_suturing_5hz\dino_featur
 
 ckpt = r"models\model_weights_2026-03-30_12-48-31\epoch47.pth"
 
-# -----------------------------
-# build model
-# -----------------------------
 encoder = LSTM_gat(hidden_size=128, embed_dim=64)
 model = FullModelWithDINOv2(
     encoder,
@@ -38,9 +32,6 @@ model.eval()
 lp = sum(p.numel() for p in model.parameters() if p.requires_grad)
 print("Learnable parameters:", lp)
 
-# -----------------------------
-# dataset
-# -----------------------------
 ds = SurgToolSequenceDataset(
     xml_path=xml_path,
     image_dir=image_dir,
@@ -56,9 +47,6 @@ ds = SurgToolSequenceDataset(
 test_dl = DataLoader(ds, batch_size=BATCH, shuffle=False)
 
 
-# -----------------------------
-# helpers
-# -----------------------------
 def _mu_from_model_out(out):
     """
     out: (B,T,N,2) or (B,T,N,4)
@@ -138,12 +126,10 @@ def rollout_one_sample(model, sample, device="cpu"):
     fut_coords = fut_coords.view(B, P, 2, 5, 2)
     fut_vis    = fut_vis.view(B, P, 2, 5)
 
-    # GT full sequence
     full_coords = torch.cat([obs_coords, fut_coords], dim=1)   # (1,O+P,2,5,2)
     full_vis    = torch.cat([obs_vis, fut_vis], dim=1)         # (1,O+P,2,5)
     gt6_full, gt6_vis = add_root_to_coords(full_coords, full_vis)
 
-    # start predicted sequence with GT obs block
     obs6, _ = add_root_to_coords(obs_coords, obs_vis)
     preds6 = [obs6[:, t] for t in range(O)]   # list of (1,2,6,2)
 
@@ -173,7 +159,6 @@ def rollout_one_sample(model, sample, device="cpu"):
         seq_coords = torch.cat([seq_coords[:, 1:], next5.unsqueeze(1)], dim=1)
         seq_vis    = torch.cat([seq_vis[:, 1:], next5_vis.unsqueeze(1)], dim=1)
 
-        # hold last visual feature for future rollout
         last_feat = seq_feats[:, -1:].clone()
         seq_feats = torch.cat([seq_feats[:, 1:], last_feat], dim=1)
 
@@ -203,14 +188,12 @@ def plot_sample_prediction(model, sample, device="cpu", instr_id=0, kp_id=0):
             label="GT Full"
         )
 
-    # observed part
     plt.plot(
         pred_traj[:O, 0],
         pred_traj[:O, 1],
         label="Observed (GT init)"
     )
 
-    # predicted future
     plt.plot(
         pred_traj[O:, 0],
         pred_traj[O:, 1],
@@ -225,10 +208,6 @@ def plot_sample_prediction(model, sample, device="cpu", instr_id=0, kp_id=0):
     plt.tight_layout()
     plt.show()
 
-
-# -----------------------------
-# run one sample
-# -----------------------------
 def plot_batch_predictions(model, dataset, device="cpu", instr_id=0, kp_id=0, num_samples=8):
     """
     Plot multiple samples in one figure (grid)
@@ -247,7 +226,6 @@ def plot_batch_predictions(model, dataset, device="cpu", instr_id=0, kp_id=0, nu
 
         ax = axes[i]
 
-        # GT full trajectory
         if gt_mask.any():
             ax.plot(
                 gt_traj[gt_mask][:, 0],
@@ -256,14 +234,12 @@ def plot_batch_predictions(model, dataset, device="cpu", instr_id=0, kp_id=0, nu
                 color="black"
             )
 
-        # observed part
         ax.plot(
             pred_traj[:O, 0],
             pred_traj[:O, 1],
             color="blue"
         )
 
-        # predicted future
         ax.plot(
             pred_traj[O-1:, 0],
             pred_traj[O-1:, 1],
@@ -273,7 +249,6 @@ def plot_batch_predictions(model, dataset, device="cpu", instr_id=0, kp_id=0, nu
         ax.set_title(f"Sample {i}")
         ax.invert_yaxis()
 
-    # legend (shared)
     fig.legend(["GT", "Observed", "Predicted"], loc="upper right")
     plt.tight_layout()
     plt.show()

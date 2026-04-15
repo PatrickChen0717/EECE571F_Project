@@ -65,18 +65,7 @@ class FullModelWithDINOv2(nn.Module):
             num_layers=1,
             batch_first=True
         )
-        
-        #### Transformer 
-        # encoder_layer = nn.TransformerEncoderLayer(
-        #     d_model=fuse_dim,
-        #     nhead=4,
-        #     dim_feedforward=2 * fuse_dim,
-        #     dropout=0.1,
-        #     batch_first=True
-        # )
-        # self.post_temporal = nn.TransformerEncoder(encoder_layer, num_layers=1)
-        # self.pos_enc = PositionalEncoding(fuse_dim)
-        
+
         self.head = nn.Sequential(
             nn.Linear(fuse_dim, fuse_dim),
             nn.ReLU(),
@@ -107,13 +96,11 @@ class FullModelWithDINOv2(nn.Module):
 
         fused = torch.cat([rhat, vis], dim=-1)        # (B,T,N,Dg+vis_dim)
         fused = self.fuse_in(fused)                   # (B,T,N,fuse_dim)
-        # TRANS
+
         fused = fused.permute(0, 2, 1, 3).contiguous()   # (B,N,T,F)
         fused = fused.view(B * N, T, -1)                 # (B*N,T,F)
 
         fused, _ = self.post_gru(fused)                  # (B*N,T,F)
-        # fused = self.pos_enc(fused)
-        # fused = self.post_temporal(fused)
 
         out = self.head(fused)                           # (B*N,T,2)
         out = out.view(B, N, T, 2).permute(0, 2, 1, 3).contiguous()  # (B,T,N,2)

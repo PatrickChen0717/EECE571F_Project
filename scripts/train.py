@@ -31,7 +31,6 @@ lr = 1e-3
 Enable_WandB = True
 
 paths_left = glob.glob(r"E:\EECE571F\SurgPose_dataset\**\keypoints_left.yaml", recursive=True)
-# paths_right = glob.glob(r"C:\Users\Patrick\Documents\eece571F\SurgPose_dataset\**\keypoints_right.yaml", recursive=True)
 
 yaml_paths = paths_left
 

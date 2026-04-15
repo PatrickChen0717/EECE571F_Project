@@ -22,7 +22,6 @@ wandb.login(key="8b49b325ce8e9e788b2981b63eebbc01ee33bc6b")
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
-# ----- fake dataset example -----
 SAVE_INTERVAL = 1
 NUM_EPOCHS = 150
 BATCH = 32
@@ -32,7 +31,7 @@ STRIDE = 10
 Normalize = False
 Smoothing = False
 Smoothing_window = 5
-M = 2               # Number of instruments
+M = 2
 lr = 1e-4
 Enable_WandB = True
 encode_hidden_size = 128
@@ -46,8 +45,6 @@ w_mag = 0.3
 
 base = Path("/raid/home/patrickbyc/SurgPose_dataset_no_vid")
 paths_left = list(base.rglob("keypoints_left.yaml"))
-# paths_right = glob.glob(r"C:\Users\Patrick\Documents\eece571F\SurgPose_dataset\**\keypoints_right.yaml", recursive=True)
-
 yaml_paths = paths_left
 
 print("num yamls:", len(yaml_paths))
@@ -114,7 +111,6 @@ if Enable_WandB:
 
 # ----- build model -----
 encoder = LSTM_gat(hidden_size=encode_hidden_size, embed_dim=encoder_embed_dim)
-# model = FullModelWithResNet(encoder, vision_dim=128).to(device)
 model = FullModelWithDINOv2(encoder, vision_dim=128).to(device)
 
 optimizer = Adam(model.parameters(), lr=lr)
@@ -365,7 +361,6 @@ def train_one_epoch(
             min_speed=1.0
         )
 
-        # optional magnitude loss, useful if predictions are too short
         mag_loss = (
             (
                 torch.norm(pred_rollout_deltas6, dim=-1) -
