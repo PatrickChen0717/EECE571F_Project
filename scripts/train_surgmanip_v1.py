@@ -1,7 +1,7 @@
 import os
 import time
 import torch
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader
 from torch.optim import Adam
 
 from src.LSTM import LSTM_gat
@@ -11,21 +11,25 @@ from data.dataloader_surgmanip import SurgToolSequenceDataset
 from pathlib import Path
 from tqdm import tqdm
 
+from dotenv import load_dotenv
 import wandb
+
+load_dotenv()
 
 wandb.login(key=os.getenv("WANDB_API_KEY"))
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
-SAVE_INTERVAL = 1
-NUM_EPOCHS = 150
-BATCH = 32
+# ----- fake dataset example -----
+SAVE_INTERVAL = 5
+NUM_EPOCHS = 200
+BATCH = 128
 O = 50
 P = 10
 STRIDE = 10
 Normalize = False
 Smoothing = False
 Smoothing_window = 5
-M = 2
+M = 2  # Number of instruments
 lr = 1e-4
 Enable_WandB = True
 encode_hidden_size = 128
@@ -69,9 +73,10 @@ test_dl = DataLoader(test_set, batch_size=BATCH, shuffle=False)
 print("num train_set:", len(train_set))
 print("num test_set:", len(test_set))
 
+
 wandb_timestamp = time.strftime("%Y-%m-%d_%H-%M-%S", time.localtime(time.time()))
 if Enable_WandB:
-    job_name = "EECE571F_Project_training" + "dataset: surgpose"
+    job_name = "EECE571F_Project_training" + "dataset: surgmanip"
     args = {
         "lr": lr,
         "hidden_size": 128,
@@ -167,9 +172,10 @@ def _get_feature_sequences(batch, device):
     return obs_delta_feats, full_feats
 
 
-def _make_gt_and_mask(model, pos_raw):
+def _make_gt_and_mask(model, pos_raw, vis_raw):
     """
     pos_raw: (B,T,M,5,2)
+    vis_raw: (B,T,M,5)
 
     returns:
       gt_delta:  (B,T-1,N,2)
@@ -177,7 +183,7 @@ def _make_gt_and_mask(model, pos_raw):
       delta_in:  (B,T-1,M,5,2)
       pos_clean: (B,T,M,5,2)
     """
-    valid_xy = torch.isfinite(pos_raw).all(dim=-1)  # (B,T,M,5)
+    valid_xy = vis_raw > 0.5  # (B,T,M,5)
     pos_clean = torch.nan_to_num(pos_raw, nan=0.0)  # (B,T,M,5,2)
 
     feat = torch.cat([pos_clean, valid_xy.unsqueeze(-1).float()], dim=-1)  # (B,T,M,5,3)
@@ -257,14 +263,14 @@ def train_one_epoch(
         obs_frames, full_frames = _get_feature_sequences(batch, device)
 
         obs = torch.nan_to_num(obs_raw, nan=0.0)
-        fut = torch.nan_to_num(fut_raw, nan=0.0)
 
         # -------------------------
         # (A) Teacher-forced delta loss
         # -------------------------
         full_raw = torch.cat([obs_raw, fut_raw], dim=1)
+        full_vis = torch.cat([obs_vis, fut_vis], dim=1)
         gt_delta, mask_delta, full_delta_in, full_clean = _make_gt_and_mask(
-            model, full_raw
+            model, full_raw, full_vis
         )
 
         out_tf = model(full_delta_in, full_frames)
@@ -278,7 +284,7 @@ def train_one_epoch(
         # -------------------------
         # (B) Rollout absolute position loss
         # -------------------------
-        fut_valid5 = torch.isfinite(fut_raw).all(dim=-1)
+        fut_valid5 = fut_vis > 0.5
         fut_clean = torch.nan_to_num(fut_raw, nan=0.0)
         fut_feat = torch.cat(
             [fut_clean, fut_valid5.unsqueeze(-1).float()], dim=-1
@@ -294,7 +300,7 @@ def train_one_epoch(
 
         seq_raw = obs_raw.clone()
         seq_clean = obs.clone()
-        seq_valid5 = torch.isfinite(seq_raw).all(dim=-1)
+        seq_valid5 = obs_vis > 0.5
 
         seq_delta_xy = seq_clean[:, 1:] - seq_clean[:, :-1]
         seq_delta_valid = seq_valid5[:, 1:] & seq_valid5[:, :-1]
@@ -378,7 +384,7 @@ def train_one_epoch(
         gt_prev6 = torch.cat([gt_fut6[:, :1], gt_fut6[:, :-1]], dim=1)  # temporary
         # first future step should be relative to last observed frame, not gt_fut6[:, :1]
         last_obs5_raw = obs_raw[:, -1]
-        last_obs5_valid = torch.isfinite(last_obs5_raw).all(dim=-1)
+        last_obs5_valid = obs_vis[:, -1] > 0.5
         last_obs5_clean = torch.nan_to_num(last_obs5_raw, nan=0.0)
         last_obs_feat = torch.cat(
             [
@@ -399,6 +405,7 @@ def train_one_epoch(
             pred_rollout_deltas6, gt_rollout_deltas6, mask=dir_mask, min_speed=1.0
         )
 
+        # optional magnitude loss, useful if predictions are too short
         mag_loss = (
             torch.norm(pred_rollout_deltas6, dim=-1)
             - torch.norm(gt_rollout_deltas6, dim=-1)
@@ -464,8 +471,9 @@ def evaluate_one_epoch(
         # (A) Teacher-forced delta loss
         # --------------------------------
         full_raw = torch.cat([obs_raw, fut_raw], dim=1)
+        full_vis = torch.cat([obs_vis, fut_vis], dim=1)
         gt_delta, mask_delta, full_delta_in, full_clean = _make_gt_and_mask(
-            model, full_raw
+            model, full_raw, full_vis
         )
 
         out_tf = model(full_delta_in, full_frames)
@@ -479,7 +487,7 @@ def evaluate_one_epoch(
         # --------------------------------
         # (B) GT future absolute positions
         # --------------------------------
-        fut_valid5 = torch.isfinite(fut_raw).all(dim=-1)
+        fut_valid5 = fut_vis > 0.5
         fut_clean = torch.nan_to_num(fut_raw, nan=0.0)
         fut_feat = torch.cat(
             [fut_clean, fut_valid5.unsqueeze(-1).float()], dim=-1
@@ -498,7 +506,7 @@ def evaluate_one_epoch(
         # --------------------------------
         seq_raw = obs_raw.clone()
         seq_clean = obs.clone()
-        seq_valid5 = torch.isfinite(seq_raw).all(dim=-1)
+        seq_valid5 = obs_vis > 0.5
 
         seq_delta_xy = seq_clean[:, 1:] - seq_clean[:, :-1]
         seq_delta_valid = seq_valid5[:, 1:] & seq_valid5[:, :-1]
@@ -580,7 +588,7 @@ def evaluate_one_epoch(
         # (D) Direction + magnitude loss
         # --------------------------------
         last_obs5_raw = obs_raw[:, -1]
-        last_obs5_valid = torch.isfinite(last_obs5_raw).all(dim=-1)
+        last_obs5_valid = obs_vis[:, -1] > 0.5
         last_obs5_clean = torch.nan_to_num(last_obs5_raw, nan=0.0)
         last_obs_feat = torch.cat(
             [
