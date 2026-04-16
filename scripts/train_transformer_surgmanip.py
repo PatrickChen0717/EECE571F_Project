@@ -5,7 +5,7 @@ import time
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader
+from torch.utils.data import ConcatDataset, DataLoader
 from torch.optim import Adam
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 
@@ -25,7 +25,7 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 
 # ----- fake dataset example -----
 SAVE_INTERVAL = 1
-NUM_EPOCHS = 200
+NUM_EPOCHS = 50
 BATCH = 64
 O = 50
 P = 10
@@ -49,7 +49,11 @@ w_delta = 0.3
 w_dir = 0.2
 w_mag = 0.3
 
-DEFAULT_DATASET_DIR = Path(os.getenv("SURGMANIP_DIR")) if os.getenv("SURGMANIP_DIR") else None
+DEFAULT_DATASET_DIR = Path("/home/lycpaul/Dataset/surgmanip/dataset")
+if not DEFAULT_DATASET_DIR.exists():
+    DEFAULT_DATASET_DIR = Path(os.getenv("SURGMANIP_DIR")) if os.getenv("SURGMANIP_DIR") else None
+
+DATA_SPLIT_SEED = 42
 
 
 def _build_argparser():
@@ -60,7 +64,7 @@ def _build_argparser():
         "--dataset-dir",
         type=Path,
         default=DEFAULT_DATASET_DIR,
-        help="Dataset root. Defaults to the SURGMANIP_DIR environment variable.",
+        help="Dataset root. Defaults to /home/lycpaul/Dataset/surgmanip/dataset, then SURGMANIP_DIR if needed.",
     )
     parser.add_argument(
         "--num-epochs",
@@ -145,6 +149,67 @@ def _resolve_resume_checkpoint(args) -> Path | None:
     return None
 
 
+def _resolve_sequence_dirs(dataset_dir: Path) -> list[Path]:
+    sequence_dirs = []
+    for entry in sorted(dataset_dir.iterdir()):
+        if not entry.is_dir():
+            continue
+        if (entry / "instances.xml").exists() or (entry / "annotations.xml").exists():
+            sequence_dirs.append(entry)
+
+    if not sequence_dirs:
+        raise FileNotFoundError(
+            f"No sequence folders with annotations found in {dataset_dir}"
+        )
+
+    return sequence_dirs
+
+
+def _resolve_annotation_path(sequence_dir: Path) -> Path:
+    for annotation_name in ("instances.xml", "annotations.xml"):
+        candidate = sequence_dir / annotation_name
+        if candidate.exists():
+            return candidate
+
+    raise FileNotFoundError(f"Missing annotation XML in {sequence_dir}")
+
+
+def _split_sequence_dirs(
+    sequence_dirs: list[Path], train_ratio: float = 0.8, seed: int = DATA_SPLIT_SEED
+) -> tuple[list[Path], list[Path]]:
+    num_sequences = len(sequence_dirs)
+    if num_sequences < 2:
+        raise ValueError("Need at least two sequences to create train/val splits.")
+
+    num_train = max(1, int(train_ratio * num_sequences))
+    if num_train >= num_sequences:
+        num_train = num_sequences - 1
+
+    permutation = torch.randperm(
+        num_sequences, generator=torch.Generator().manual_seed(seed)
+    ).tolist()
+    train_indices = permutation[:num_train]
+    val_indices = permutation[num_train:]
+
+    train_dirs = [sequence_dirs[idx] for idx in train_indices]
+    val_dirs = [sequence_dirs[idx] for idx in val_indices]
+    return train_dirs, val_dirs
+
+
+def _build_sequence_dataset(sequence_dir: Path) -> SurgToolSequenceDataset:
+    return SurgToolSequenceDataset(
+        xml_path=str(_resolve_annotation_path(sequence_dir)),
+        image_dir=str(sequence_dir),
+        feature_dir=str(sequence_dir),
+        obs_len=O,
+        pred_len=P,
+        image_transform=None,
+        normalize_coords=False,
+        include_images=False,
+        include_features=True,
+    )
+
+
 def _load_checkpoint(model, optimizer, scheduler, checkpoint_path: Path, device: str) -> int:
     checkpoint = torch.load(checkpoint_path, map_location=device)
 
@@ -167,31 +232,32 @@ cli_args = _build_argparser().parse_args()
 
 dataset_dir = cli_args.dataset_dir
 if dataset_dir is None:
-    raise ValueError("SURGMANIP_DIR is not set.")
+    raise ValueError("Dataset directory is not set.")
+dataset_dir = dataset_dir.expanduser().resolve()
 
 resume_checkpoint = _resolve_resume_checkpoint(cli_args)
 
-train_set = SurgToolSequenceDataset(
-    dataset_dir=dataset_dir,
-    split="train",
-    obs_len=O,
-    pred_len=P,
-    image_transform=None,
-    normalize_coords=False,
-    include_images=False,
-    include_features=True,
+sequence_dirs = _resolve_sequence_dirs(dataset_dir)
+train_sequence_dirs, val_sequence_dirs = _split_sequence_dirs(sequence_dirs)
+
+train_set = ConcatDataset(
+    [_build_sequence_dataset(sequence_dir) for sequence_dir in train_sequence_dirs]
+)
+test_set = ConcatDataset(
+    [_build_sequence_dataset(sequence_dir) for sequence_dir in val_sequence_dirs]
 )
 
-test_set = SurgToolSequenceDataset(
-    dataset_dir=dataset_dir,
-    split="val",
-    obs_len=O,
-    pred_len=P,
-    image_transform=None,
-    normalize_coords=False,
-    include_images=False,
-    include_features=True,
+print(f"Dataset directory: {dataset_dir}")
+print(
+    f"Train sequences ({len(train_sequence_dirs)}): "
+    f"{[path.name for path in train_sequence_dirs]}"
 )
+print(
+    f"Val sequences ({len(val_sequence_dirs)}): "
+    f"{[path.name for path in val_sequence_dirs]}"
+)
+print(f"Train samples: {len(train_set)}")
+print(f"Val samples: {len(test_set)}")
 
 train_dl = DataLoader(train_set, batch_size=BATCH, shuffle=True)
 test_dl = DataLoader(test_set, batch_size=BATCH, shuffle=False)
@@ -231,6 +297,11 @@ if Enable_WandB:
         "w_delta": w_delta,
         "w_dir": w_dir,
         "w_mag": w_mag,
+        "dataset_dir": str(dataset_dir),
+        "data_split_seed": DATA_SPLIT_SEED,
+        "num_sequences_total": len(sequence_dirs),
+        "num_sequences_train": len(train_sequence_dirs),
+        "num_sequences_val": len(val_sequence_dirs),
         "resume_checkpoint": str(resume_checkpoint) if resume_checkpoint is not None else None,
         "checkpoint_dir": str(checkpoint_dir),
         "scheduler_type": "ReduceLROnPlateau",
