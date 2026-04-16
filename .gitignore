@@ -10,3 +10,8 @@ models/*
 
 # WandB
 wandb/
+test/
+.env
+outputs/
+models*/
+*.csv
