@@ -28,7 +28,15 @@ def prepare_model(model, ckpt, label):
         return False
 
     checkpoint = torch.load(ckpt, map_location=device)
-    state_dict = checkpoint.get("model_state_dict") if isinstance(checkpoint, dict) else checkpoint
+    if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
+        state_dict = checkpoint["model_state_dict"]
+    else:
+        state_dict = checkpoint
+
+    if state_dict is None:
+        raise ValueError(
+            f"{label}: checkpoint {ckpt} does not contain model weights."
+        )
     model.load_state_dict(state_dict)
     model.eval()
 
@@ -108,8 +116,8 @@ stride = 10
 encoder = LSTM_gat(hidden_size=encoder_hidden_size, embed_dim=encoder_embed_dim)
 model_LSTMGAT = FullModelWithDINOv2(encoder, vision_dim=128).to(device)
 
-# ckpt = "models/model_weights_2026-03-31_19-05-26/epoch45.pth" # 128, 64, 2 GAT, GRU (current best model)
-ckpt = None
+ckpt = "models/model_weights_2026-04-15_19-39-07/epoch7.pth" # 128, 64, 2 GAT, GRU (current best model)
+# ckpt = None
 has_lstmgat = prepare_model(model_LSTMGAT, ckpt, "LSTMGAT")
 
 #############Transformer############
